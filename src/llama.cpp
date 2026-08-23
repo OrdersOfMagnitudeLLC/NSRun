@@ -695,6 +695,10 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
 }
 
 bool llama_context::update_cache_copies() {
+#ifdef NS_KVC
+    // NSKVCache integration point — stub, not yet active
+    // Full implementation in next session
+#endif
     if (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) return true;
     if (model.arch == LLM_ARCH_DEEPSEEK4) return true;
     auto patch_dsa_cache_copies = [&]() -> bool {

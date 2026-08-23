@@ -135,6 +135,12 @@ add_library(llama
             graphs/build_minimaxm3.cpp
             graphs/build_smollm3.cpp
             )
+option(GGML_NS_KVC "Enable NSKVCache compression" OFF)
+
+if (GGML_NS_KVC)
+    target_sources(llama PRIVATE ns_kv_store.cpp)
+    target_compile_definitions(llama PRIVATE NS_KVC)
+endif()
 
 target_include_directories(llama PUBLIC . ../include)
 target_include_directories(llama PRIVATE ../ggml/src)
