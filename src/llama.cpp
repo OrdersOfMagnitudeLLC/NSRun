@@ -1,3 +1,20 @@
+#ifdef NS_KVC
+#include "ns_kv_store.h"
+static NSKVStore* g_ns_kvc = nullptr;
+static void ns_kvc_ensure_init(size_t n_layers, size_t n_floats_per_kv) {
+    if (!g_ns_kvc) {
+        NSKVConfig cfg;
+        cfg.n_layers      = n_layers;
+        cfg.capacity      = 4096;
+        cfg.n_kv_heads    = 1;
+        cfg.head_dim      = n_floats_per_kv;
+        cfg.latent_dim    = 0;
+        cfg.debug_float32 = false;
+        g_ns_kvc = new NSKVStore(cfg);
+    }
+}
+#endif
+
 //
 // Copyright (C) 2023-2025 The llama.cpp authors
 // Copyright (C) 2024-2025 Iwan Kawrakow
@@ -695,10 +712,6 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
 }
 
 bool llama_context::update_cache_copies() {
-#ifdef NS_KVC
-    // NSKVCache integration point — stub, not yet active
-    // Full implementation in next session
-#endif
     if (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) return true;
     if (model.arch == LLM_ARCH_DEEPSEEK4) return true;
     auto patch_dsa_cache_copies = [&]() -> bool {
@@ -815,6 +828,33 @@ bool llama_context::update_cache_copies() {
                 c.cpy->src[1]->data = (char *)kv_self.v_l[il]->data + c.cpy->view_offs;
                 c.cpy->data = c.cpy->src[1]->data;
             }
+#ifdef NS_KVC
+        {
+            const size_t n_layers = (size_t)n_layer;
+            const ggml_type ktype = kv_self.k_l[il]->type;
+            if (ktype != GGML_TYPE_F16 && ktype != GGML_TYPE_F32) {
+                goto ns_kvc_skip;
+            }
+            {
+            const size_t n_floats = c.step / sizeof(ggml_fp16_t);
+            ns_kvc_ensure_init(n_layers, n_floats);
+            if (g_ns_kvc) {
+                const ggml_fp16_t* k_f16 = (const ggml_fp16_t*)
+                    ((char*)kv_self.k_l[il]->data + cache_head * c.step);
+                const ggml_fp16_t* v_f16 = (const ggml_fp16_t*)
+                    ((char*)kv_self.v_l[il]->data + cache_head * c.step);
+                std::vector<float> k_f32(n_floats), v_f32(n_floats);
+                for (size_t i = 0; i < n_floats; ++i) {
+                    k_f32[i] = ggml_fp16_to_fp32(k_f16[i]);
+                    v_f32[i] = ggml_fp16_to_fp32(v_f16[i]);
+                }
+                g_ns_kvc->write((size_t)il, (size_t)cache_head,
+                                k_f32.data(), v_f32.data(), n_floats);
+            }
+            }
+            ns_kvc_skip:;
+        }
+#endif
         }
     }
     return patch_dsa_cache_copies();
