@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <ggml.h>
 
 // ── INT8 block ─────────────────────────────────────────────────────────────
 // 8 floats → 1 uint16 scale (float16) + 8 bytes int8 = 10 bytes
@@ -71,7 +72,7 @@ public:
     // n_floats = n_kv_heads * head_dim.
     // Computes and stores the L2 V-norm as the slot's information score.
     void write(size_t layer, size_t seq_pos,
-               const float* k, const float* v, size_t n_floats);
+               const ggml_fp16_t* k, const ggml_fp16_t* v, size_t n_floats);
 
     // Read K and V for one (layer, seq_pos) into caller float buffers.
     // Dequantizes only the kv_head slice needed: 

@@ -832,7 +832,7 @@ bool llama_context::update_cache_copies() {
         {
             const size_t n_layers = (size_t)n_layer;
             const ggml_type ktype = kv_self.k_l[il]->type;
-            if (ktype != GGML_TYPE_F16 && ktype != GGML_TYPE_F32) {
+            if (ktype != GGML_TYPE_F16) {
                 goto ns_kvc_skip;
             }
             {
@@ -843,13 +843,8 @@ bool llama_context::update_cache_copies() {
                     ((char*)kv_self.k_l[il]->data + cache_head * c.step);
                 const ggml_fp16_t* v_f16 = (const ggml_fp16_t*)
                     ((char*)kv_self.v_l[il]->data + cache_head * c.step);
-                std::vector<float> k_f32(n_floats), v_f32(n_floats);
-                for (size_t i = 0; i < n_floats; ++i) {
-                    k_f32[i] = ggml_fp16_to_fp32(k_f16[i]);
-                    v_f32[i] = ggml_fp16_to_fp32(v_f16[i]);
-                }
                 g_ns_kvc->write((size_t)il, (size_t)cache_head,
-                                k_f32.data(), v_f32.data(), n_floats);
+                                k_f16, v_f16, n_floats);
             }
             }
             ns_kvc_skip:;

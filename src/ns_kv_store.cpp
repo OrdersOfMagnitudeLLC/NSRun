@@ -12,11 +12,7 @@ NSKVStore::NSKVStore(const NSKVConfig& cfg)
     n_blocks_per_entry_ = (kv_floats + 7) / 8;  // ceil
     blocks_per_head_ = (cfg_.head_dim + 7) / 8;  // ceil
 
-    if (cfg_.debug_float32) {
-        entry_bytes_ = 2 * cfg_.n_kv_heads * cfg_.head_dim * sizeof(float);
-    } else {
-        entry_bytes_ = 2 * n_blocks_per_entry_ * sizeof(KVBlock8);
-    }
+    entry_bytes_ = 2 * n_floats_ * sizeof(ggml_fp16_t);
 
     // Assert head_dim is multiple of 8 (true for modern models)
     assert(cfg_.head_dim % 8 == 0 && "head_dim must be multiple of 8");
@@ -51,61 +47,22 @@ void NSKVStore::ensure_page(size_t slot) {
 }
 
 void NSKVStore::write(size_t layer, size_t seq_pos,
-                       const float* k, const float* v, size_t n_floats) {
+                       const ggml_fp16_t* k, const ggml_fp16_t* v, size_t n_floats) {
     size_t slot = seq_pos % cfg_.capacity;
 
     ensure_page(slot);
 
     size_t page_idx = slot / PAGE_SLOTS;
     page_last_access_[page_idx] = seq_pos;
-
-    // Compute L2 norm of the V vector as the information-content signal.
-    float v_norm_sq = 0.0f;
-    for (size_t i = 0; i < n_floats; ++i) {
-        v_norm_sq += v[i] * v[i];
-    }
-    float v_norm = std::sqrt(v_norm_sq);
-    max_v_norm_ = std::max(max_v_norm_, v_norm);
     max_seq_pos_ = std::max(max_seq_pos_, seq_pos);
 
-    // DEBUG: bypass quantization for testing
-    if (cfg_.debug_float32) {
-        size_t local = slot % PAGE_SLOTS;
-        float* dst = (float*)(pages_[page_idx] +
+    size_t local = slot % PAGE_SLOTS;
+    ggml_fp16_t* dst = (ggml_fp16_t*)(pages_[page_idx] +
                      (layer * PAGE_SLOTS + local) * entry_bytes_);
-        memcpy(dst,           k, n_floats * sizeof(float));  // K
-        memcpy(dst + n_floats, v, n_floats * sizeof(float)); // V
-        info_scores_[slot] = v_norm;
-        seq_pos_[slot] = seq_pos;
-        if (!valid_[slot]) n_stored_++;
-        valid_[slot] = true;
-        return;
-    }
+    memcpy(dst,           k, n_floats * sizeof(ggml_fp16_t));  // K
+    memcpy(dst + n_floats, v, n_floats * sizeof(ggml_fp16_t)); // V
 
-    // Quantize K blocks
-    size_t n_blocks = (n_floats + 7) / 8;
-    KVBlock8* k_dst = k_blocks(layer, slot);
-    KVBlock8* v_dst = v_blocks(layer, slot);
-
-    for (size_t b = 0; b < n_blocks; ++b) {
-        size_t src_offset = b * 8;
-        if (src_offset < n_floats) {
-            // Full or partial block
-            float src_buf[8] = {0};
-            size_t copy_len = std::min(size_t(8), n_floats - src_offset);
-            memcpy(src_buf, k + src_offset, copy_len * sizeof(float));
-            kv_q8_encode(src_buf, k_dst + b);
-
-            memcpy(src_buf, v + src_offset, copy_len * sizeof(float));
-            kv_q8_encode(src_buf, v_dst + b);
-        } else {
-            // Zero block (shouldn't happen with proper ceil)
-            memset(k_dst + b, 0, sizeof(KVBlock8));
-            memset(v_dst + b, 0, sizeof(KVBlock8));
-        }
-    }
-
-    info_scores_[slot] = v_norm;
+    info_scores_[slot] = 0.0f;
     seq_pos_[slot] = seq_pos;
     if (!valid_[slot]) {
         n_stored_++;
