@@ -714,6 +714,7 @@ extern "C" {
         GGML_OP_MASK_TO_IDX,
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
+        GGML_OP_NS_ATTENTION,
 
         GGML_OP_COUNT,
     };
@@ -2510,6 +2511,20 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // NSAttend: sparse attention with head type detection.
+    // q:    [Dk, n_head, n_tokens, 1]
+    // k:    [Dk, n_kv, n_head_kv, 1]
+    // v:    [Dv, n_kv, n_head_kv, 1]
+    // mask: [n_kv, n_tokens, 1, 1] (optional, can be NULL)
+    // res:  [Dv, n_head, n_tokens, 1]
+    GGML_API struct ggml_tensor * ggml_ns_attention(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale);
 
     // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
     // The value vector of cache row n is cache[dv_off .. dv_off+dv, n] (MLA "absorbed"

@@ -4360,9 +4360,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MASK_TO_IDX",
     "LATENT_ATTN",
     "DS4_COMP",
+    "NS_ATTENTION",
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4489,10 +4490,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "mask_to_idx(masl)",
     "latent_attn_prefix(q,c,pk,pv,mask)",
     "ds4_comp(state, score, idx)",
+    "ns_attention(q, k, v, mask, scale)",
 
 };
 
-static_assert(GGML_OP_COUNT == 111, "GGML_OP_COUNT != 111");
+static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -10803,6 +10805,38 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+// ggml_ns_attention
+
+GGML_API struct ggml_tensor * ggml_ns_attention(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                  scale) {
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1]);
+    GGML_ASSERT(k->ne[2] == v->ne[2]);
+
+    // q: [Dk, n_tokens, n_head, 1] (after ggml_permute(ctx, q_cur, 0, 2, 1, 3))
+    // k: [Dk, n_kv, n_head_kv, 1]
+    // v: [Dv, n_kv, n_head_kv, 1]
+    // result: [Dv, n_head, n_tokens, 1] (matching flash_attn_ext output shape)
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op   = GGML_OP_NS_ATTENTION;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+
+    return result;
 }
 
 // ggml_flash_attn_back
@@ -22869,6 +22903,200 @@ static void ggml_compute_forward_grouped_topk(
     }
 }
 
+// ggml_compute_forward_ns_attention
+
+static void ggml_compute_forward_ns_attention(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+
+    if (params->ith != 0) return;
+
+    const struct ggml_tensor * q_t = dst->src[0];
+    const struct ggml_tensor * k_t = dst->src[1];
+    const struct ggml_tensor * v_t = dst->src[2];
+    const struct ggml_tensor * mask = dst->src[3];
+
+    float scale;
+    memcpy(&scale, dst->op_params, sizeof(float));
+
+    const int64_t Dk = q_t->ne[0];
+    const int64_t Dv = v_t->ne[0];
+    // Q is permuted [Dk, n_tokens, n_head, 1] — ne[1]=n_tokens, ne[2]=n_head
+    const int64_t n_head = q_t->ne[2];
+    const int64_t n_head_kv = k_t->ne[2];
+    const int64_t n_tokens = q_t->ne[1];
+    const int64_t n_kv = k_t->ne[1];
+
+    const enum ggml_type q_type = q_t->type;
+    const enum ggml_type k_type = k_t->type;
+    const enum ggml_type v_type = v_t->type;
+    const enum ggml_type m_type = mask ? mask->type : GGML_TYPE_F32;
+
+    float * scores = (float *) params->wdata;
+
+    for (int64_t h = 0; h < n_head; h++) {
+        const int64_t hk = h * n_head_kv / n_head;
+
+        // Sanity log: print first 4 values of Q, K, V raw data for the first head
+        if (h == 0) {
+            fprintf(stderr, "NSAttend sanity: Dk=%lld Dv=%lld n_head=%lld n_head_kv=%lld n_tokens=%lld n_kv=%lld\n",
+                    (long long)Dk, (long long)Dv, (long long)n_head, (long long)n_head_kv,
+                    (long long)n_tokens, (long long)n_kv);
+            fprintf(stderr, "NSAttend sanity: q_t->nb = [%lld, %lld, %lld, %lld]\n",
+                    (long long)q_t->nb[0], (long long)q_t->nb[1], (long long)q_t->nb[2], (long long)q_t->nb[3]);
+            fprintf(stderr, "NSAttend sanity: k_t->nb = [%lld, %lld, %lld, %lld]\n",
+                    (long long)k_t->nb[0], (long long)k_t->nb[1], (long long)k_t->nb[2], (long long)k_t->nb[3]);
+            fprintf(stderr, "NSAttend sanity: v_t->nb = [%lld, %lld, %lld, %lld]\n",
+                    (long long)v_t->nb[0], (long long)v_t->nb[1], (long long)v_t->nb[2], (long long)v_t->nb[3]);
+            fprintf(stderr, "NSAttend sanity: dst->nb = [%lld, %lld, %lld, %lld]\n",
+                    (long long)dst->nb[0], (long long)dst->nb[1], (long long)dst->nb[2], (long long)dst->nb[3]);
+            fprintf(stderr, "NSAttend sanity: q_type=%d k_type=%d v_type=%d scale=%f\n",
+                    (int)q_type, (int)k_type, (int)v_type, scale);
+            // Print first 4 Q values (head 0, token 0)
+            const char * q0 = (const char *)q_t->data;
+            fprintf(stderr, "NSAttend sanity: Q[0:4] =");
+            for (int d = 0; d < 4 && d < Dk; d++) {
+                float qv = q_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(q0 + d * q_t->nb[0])) : *(const float *)(q0 + d * q_t->nb[0]);
+                fprintf(stderr, " %f", qv);
+            }
+            fprintf(stderr, "\n");
+            // Print first 4 K values (head_kv 0, kv 0)
+            const char * k0 = (const char *)k_t->data;
+            fprintf(stderr, "NSAttend sanity: K[0:4] =");
+            for (int d = 0; d < 4 && d < Dk; d++) {
+                float kv = k_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(k0 + d * k_t->nb[0])) : *(const float *)(k0 + d * k_t->nb[0]);
+                fprintf(stderr, " %f", kv);
+            }
+            fprintf(stderr, "\n");
+            // Print first 4 V values (head_kv 0, kv 0)
+            const char * v0 = (const char *)v_t->data;
+            fprintf(stderr, "NSAttend sanity: V[0:4] =");
+            for (int d = 0; d < 4 && d < Dv; d++) {
+                float vv = v_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(v0 + d * v_t->nb[0])) : *(const float *)(v0 + d * v_t->nb[0]);
+                fprintf(stderr, " %f", vv);
+            }
+            fprintf(stderr, "\n");
+        }
+
+        // Head type detection: sample 8 query rows
+        int head_local = 0; // 0=UNIFORM/dense, 1=LOCAL
+        if (n_tokens >= 16 && n_kv >= 64) {
+            const int sample_rows = 8;
+            float total_corr = 0.0f;
+
+            for (int s = 0; s < sample_rows; s++) {
+                int i = (int)(((int64_t)s * n_tokens / sample_rows) < (n_tokens - 1) ? ((int64_t)s * n_tokens / sample_rows) : (n_tokens - 1));
+                const char * q_ptr = (const char *)q_t->data + h * q_t->nb[2] + i * q_t->nb[1];
+
+                float max_score = -1e30f;
+                for (int64_t j = 0; j < n_kv; j++) {
+                    const char * k_ptr = (const char *)k_t->data + hk * k_t->nb[2] + j * k_t->nb[1];
+                    float dot = 0.0f;
+                    for (int64_t d = 0; d < Dk; d++) {
+                        float qv = q_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(q_ptr + d * q_t->nb[0])) : *(const float *)(q_ptr + d * q_t->nb[0]);
+                        float kv = k_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(k_ptr + d * k_t->nb[0])) : *(const float *)(k_ptr + d * k_t->nb[0]);
+                        dot += qv * kv;
+                    }
+                    scores[j] = dot * scale;
+                    if (scores[j] > max_score) max_score = scores[j];
+                }
+
+                float sum = 0.0f;
+                for (int64_t j = 0; j < n_kv; j++) {
+                    scores[j] = expf(scores[j] - max_score);
+                    sum += scores[j];
+                }
+
+                int q_pos = (int)(n_kv - n_tokens + i);
+                float mean_w = sum / n_kv;
+                float num = 0.0f, den_d = 0.0f, den_w = 0.0f;
+                for (int64_t j = 0; j < n_kv; j++) {
+                    float dist = (float)abs(q_pos - (int)j);
+                    float w = scores[j] / sum;
+                    float d_diff = dist - (n_kv / 2.0f);
+                    float w_diff = w - mean_w;
+                    num += d_diff * w_diff;
+                    den_d += d_diff * d_diff;
+                    den_w += w_diff * w_diff;
+                }
+                float corr = (den_d > 0.0f && den_w > 0.0f) ? num / sqrtf(den_d * den_w) : 0.0f;
+                total_corr += fabsf(corr);
+            }
+
+            if (total_corr / sample_rows > 0.3f) {
+                head_local = 1;
+            }
+        }
+
+        int local_window = n_kv / 4;
+        if (local_window < 1) local_window = 1;
+
+        for (int64_t i = 0; i < n_tokens; i++) {
+            const char * q_ptr = (const char *)q_t->data + h * q_t->nb[2] + i * q_t->nb[1];
+
+            int64_t j_start = 0, j_end = n_kv;
+            if (head_local) {
+                int q_pos = (int)(n_kv - n_tokens + i);
+                j_start = (q_pos - local_window) > 0 ? (q_pos - local_window) : 0;
+                j_end = ((int64_t)(q_pos + local_window + 1) < n_kv) ? (int64_t)(q_pos + local_window + 1) : n_kv;
+            }
+
+            float max_score = -1e30f;
+            for (int64_t j = 0; j < n_kv; j++) {
+                if (j < j_start || j >= j_end) {
+                    scores[j] = -1e30f;
+                    continue;
+                }
+                const char * k_ptr = (const char *)k_t->data + hk * k_t->nb[2] + j * k_t->nb[1];
+                float dot = 0.0f;
+                for (int64_t d = 0; d < Dk; d++) {
+                    float qv = q_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(q_ptr + d * q_t->nb[0])) : *(const float *)(q_ptr + d * q_t->nb[0]);
+                    float kv = k_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(k_ptr + d * k_t->nb[0])) : *(const float *)(k_ptr + d * k_t->nb[0]);
+                    dot += qv * kv;
+                }
+                scores[j] = dot * scale;
+
+                if (mask) {
+                    const char * mp = (const char *)mask->data + i * mask->nb[1] + j * mask->nb[0];
+                    float mv = m_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)mp) : *(const float *)mp;
+                    scores[j] += mv;
+                }
+
+                if (scores[j] > max_score) max_score = scores[j];
+            }
+
+            float sum = 0.0f;
+            for (int64_t j = 0; j < n_kv; j++) {
+                if (scores[j] == -1e30f) {
+                    scores[j] = 0.0f;
+                    continue;
+                }
+                scores[j] = expf(scores[j] - max_score);
+                sum += scores[j];
+            }
+            if (sum > 0.0f) {
+                for (int64_t j = 0; j < n_kv; j++) {
+                    scores[j] /= sum;
+                }
+            }
+
+            float * out_ptr = (float *)((char *)dst->data + h * dst->nb[1] + i * dst->nb[2]);
+            for (int64_t d = 0; d < Dv; d++) {
+                out_ptr[d] = 0.0f;
+            }
+            for (int64_t j = j_start; j < j_end; j++) {
+                if (scores[j] == 0.0f) continue;
+                const char * v_ptr = (const char *)v_t->data + hk * v_t->nb[2] + j * v_t->nb[1];
+                float weight = scores[j];
+                for (int64_t d = 0; d < Dv; d++) {
+                    float vv = v_type == GGML_TYPE_F16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(v_ptr + d * v_t->nb[0])) : *(const float *)(v_ptr + d * v_t->nb[0]);
+                    out_ptr[d] += weight * vv;
+                }
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_flash_attn_ext
 
 static void ggml_compute_forward_flash_attn_ext_f16(
@@ -26807,6 +27035,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
                     ggml_compute_forward_ds4_comp_type1(params, tensor);
                 }
             } break;
+        case GGML_OP_NS_ATTENTION:
+            {
+                ggml_compute_forward_ns_attention(params, tensor);
+            } break;
         case GGML_OP_INDEXER_TOPK:
             {
                 if (!iqk_indexer_topk(tensor, params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, params->ith, params->nth)) {
@@ -27886,6 +28118,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_MASK_TO_IDX:
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
+        case GGML_OP_NS_ATTENTION:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -28635,6 +28868,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MASK_TO_IDX:
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
+        case GGML_OP_NS_ATTENTION:
             {
                 n_tasks = n_threads;
             } break;
@@ -28981,6 +29215,10 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                         int ratio = idx->ne[0] / (2*node->ne[1]);
                         cur = 32*(4*ratio + 3)*sizeof(float)*n_tasks;
                     }
+                } break;
+            case GGML_OP_NS_ATTENTION:
+                {
+                    cur = node->src[1]->ne[1] * sizeof(float); // scores buffer
                 } break;
             case GGML_OP_CROSS_ENTROPY_LOSS:
                 {

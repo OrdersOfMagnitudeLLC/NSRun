@@ -5,6 +5,7 @@
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
+#include "kv-box.h"
 
 struct llama_model;
 
@@ -326,6 +327,7 @@ struct llama_context {
     struct llama_cparams        cparams;
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
+    struct KVBox                kv_box;
     struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 

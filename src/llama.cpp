@@ -6603,6 +6603,51 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
+        // KVBox: mirror KV writes to compressed cache
+        if (cparams.kv_box && lctx.kv_box.initialized()) {
+            const int n_layer_kv = model.mtp ? (int)hparams.n_layer
+                                             : (int)hparams.n_layer - (int)hparams.nextn_predict_layers;
+            for (int il = 0; il < n_layer_kv; ++il) {
+                if (hparams.is_recurrent(il)) continue;
+                if (il >= (int)kv_self.k_l.size() || !kv_self.k_l[il]) continue;
+                if (kv_self.k_l[il]->type != GGML_TYPE_F16) continue;
+                if (kv_self.k_l[il]->extra) continue;
+
+                const int32_t cache_head = kv_self.is_compacted(il)
+                    ? (int32_t)kv_self.head_swa : (int32_t)kv_self.head;
+                const size_t k_step = lctx.cache_copies[2*il+0].step;
+                if (k_step == 0) continue;
+
+                const uint32_t n_kv_heads = hparams.n_head_kv(il);
+                const uint32_t head_dim   = hparams.n_embd_head_k(il);
+
+                bool has_v = !kv_self.v_l.empty() && il < (int)kv_self.v_l.size() && kv_self.v_l[il];
+                size_t v_step = 0;
+                if (has_v) {
+                    v_step = lctx.cache_copies[2*il+1].step;
+                    if (v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) {
+                        has_v = false;
+                    }
+                }
+
+                for (uint32_t t = 0; t < n_tokens; ++t) {
+                    const ggml_fp16_t* k_data = (const ggml_fp16_t*)
+                        ((char*)kv_self.k_l[il]->data + (size_t)(cache_head + t) * k_step);
+                    const ggml_fp16_t* v_data = nullptr;
+                    if (has_v) {
+                        v_data = (const ggml_fp16_t*)
+                            ((char*)kv_self.v_l[il]->data + (size_t)(cache_head + t) * v_step);
+                    }
+                    for (uint32_t h = 0; h < n_kv_heads; ++h) {
+                        const ggml_fp16_t* k_head = k_data + h * head_dim;
+                        const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
+                        lctx.kv_box.write_slot(lctx.kv_box.abs_pos + t, il, h, k_head, v_head);
+                    }
+                }
+            }
+            lctx.kv_box.abs_pos += n_tokens;
+        }
+
         bool reset_previous = false;
         // update the kv ring buffer
         {
@@ -7644,6 +7689,7 @@ struct llama_context_params llama_context_default_params() {
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.flash_attn                  =*/ true,
+        /*.ns_attend                   =*/ false,
         /*.mla_attn                    =*/ 3,
         /*.attn_max_batch              =*/ 256,
         /*.fused_moe_up_gate           =*/ true,
@@ -7655,6 +7701,7 @@ struct llama_context_params llama_context_default_params() {
         /*.dsa                         =*/ false,
         /*.fused_idx_topk              =*/ true,
         /*.swa_compress                =*/ false,
+        /*.kv_box                      =*/ false,
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
@@ -8134,6 +8181,7 @@ struct llama_context * llama_init_from_model(
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;
+    cparams.ns_attend        = params.ns_attend;
     cparams.mla_attn         = params.mla_attn;
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
@@ -8145,6 +8193,7 @@ struct llama_context * llama_init_from_model(
     cparams.dsa              = params.dsa;
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;
+    cparams.kv_box           = params.kv_box;
     cparams.dsa_top_k        = params.dsa_top_k;
 
     if (cparams.swa_compress != model->swa_compress) {
@@ -8344,6 +8393,17 @@ struct llama_context * llama_init_from_model(
     ctx->is_encoding  = llama_model_has_encoder(model);
 
     uint32_t kv_size = cparams.n_ctx;
+    // When KVBox is enabled, use a small working KV cache (just n_batch tokens)
+    // and let KVBox own the full context. This avoids the massive allocation
+    // for the standard KV cache at large context sizes.
+    uint32_t kv_box_full_ctx = 0;
+    if (cparams.kv_box) {
+        kv_box_full_ctx = kv_size;
+        kv_size = cparams.n_batch;
+        cparams.n_ctx = kv_size;
+        LLAMA_LOG_INFO("%s: KVBox mode: working KV cache reduced to %u tokens, KVBox owns %u tokens\n",
+                __func__, kv_size, kv_box_full_ctx);
+    }
     ggml_type type_k = params.type_k;
     ggml_type type_v = params.type_v;
 
@@ -8521,6 +8581,17 @@ struct llama_context * llama_init_from_model(
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
             return nullptr;
+        }
+
+        if (cparams.kv_box) {
+            const uint32_t n_layer_kv = model->mtp ? hparams.n_layer
+                                                   : hparams.n_layer - hparams.nextn_predict_layers;
+            const uint32_t n_kv_heads = hparams.n_head_kv(0);
+            const uint32_t head_dim   = hparams.n_embd_head_k(0);
+            ctx->kv_box.init(n_layer_kv, n_kv_heads, head_dim, kv_box_full_ctx);
+            LLAMA_LOG_INFO("%s: KVBox initialized: %u layers, %u heads, %u dim, %u slots, %.2f MiB (full ctx: %u)\n",
+                    __func__, n_layer_kv, n_kv_heads, head_dim, (uint32_t)ctx->kv_box.n_slots,
+                    (float)ctx->kv_box.total_bytes / (1024.0f * 1024.0f), kv_box_full_ctx);
         }
 
         if (params.n_seq_max > 1 && ctx->kv_self.any_compacted()) {
@@ -12928,6 +12999,32 @@ void llama_print_timings(struct llama_context * ctx) {
     LLAMA_LOG_INFO("%s:        eval time = %10.2f ms / %5d runs   (%8.2f ms per token, %8.2f tokens per second)\n",
             __func__, timings.t_eval_ms, timings.n_eval, timings.t_eval_ms / timings.n_eval, 1e3 / timings.t_eval_ms * timings.n_eval);
     LLAMA_LOG_INFO("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (timings.t_end_ms - timings.t_start_ms), (timings.n_p_eval + timings.n_eval));
+
+    if (ctx->cparams.kv_box && ctx->kv_box.initialized()) {
+        size_t ik_kv_bytes = 0;
+        for (auto & k : ctx->kv_self.k_l) {
+            if (k) ik_kv_bytes += ggml_nbytes(k);
+        }
+        for (auto & v : ctx->kv_self.v_l) {
+            if (v) ik_kv_bytes += ggml_nbytes(v);
+        }
+        // What the full-size KV cache would have been (working cache is reduced)
+        size_t full_kv_bytes = ik_kv_bytes * (ctx->kv_box.n_tokens / ctx->kv_self.size);
+        const uint64_t slots_used = ctx->kv_box.slots_used_count();
+        LLAMA_LOG_INFO("\n%s: KVBox stats:\n", __func__);
+        LLAMA_LOG_INFO("%s:    slots used  = %llu / %llu (%.1f%%)\n", __func__,
+                (unsigned long long)slots_used, (unsigned long long)ctx->kv_box.n_slots,
+                ctx->kv_box.n_slots ? 100.0 * slots_used / ctx->kv_box.n_slots : 0.0);
+        LLAMA_LOG_INFO("%s:    total writes = %llu\n", __func__, (unsigned long long)ctx->kv_box.writes);
+        LLAMA_LOG_INFO("%s:    KVBox alloc  = %.2f MiB\n", __func__,
+                (float)ctx->kv_box.total_bytes / (1024.0f * 1024.0f));
+        LLAMA_LOG_INFO("%s:    working KV   = %.2f MiB (%u tokens)\n", __func__,
+                (float)ik_kv_bytes / (1024.0f * 1024.0f), (uint32_t)ctx->kv_self.size);
+        LLAMA_LOG_INFO("%s:    full ctx KV  = %.2f MiB (%llu tokens)\n", __func__,
+                (float)full_kv_bytes / (1024.0f * 1024.0f), (unsigned long long)ctx->kv_box.n_tokens);
+        LLAMA_LOG_INFO("%s:    compression  = %.2fx\n", __func__,
+                full_kv_bytes > 0 ? (double)full_kv_bytes / (double)ctx->kv_box.total_bytes : 0.0);
+    }
 }
 
 void llama_reset_timings(struct llama_context * ctx) {

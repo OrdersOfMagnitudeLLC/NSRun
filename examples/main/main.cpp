@@ -1397,6 +1397,11 @@ int main(int argc, char ** argv) {
                 t_prompt_processing_ms + t_token_generation_ms, n_prompt_tokens_processed + n_decoded);
 
         common_speculative_print_stats(spec, n_gen_second, n_decoded, n_past, &params.speculative);
+
+        // KVBox stats
+        if (params.kv_box) {
+            llama_print_timings(ctx);
+        }
     } else {
         llama_print_timings(ctx);
         common_speculative_print_stats(spec);

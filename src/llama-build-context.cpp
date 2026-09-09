@@ -2100,8 +2100,38 @@ static ggml_tensor * llm_build_kqv(
         cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
     } else {
 
+        if (cparams.ns_attend) {
+            // NSAttend sparse attention path
+            // k is already [Dk, n_kv, n_head_kv] from the view above
+            // Need v as [Dv, n_kv, n_head_kv] (not transposed)
+            struct ggml_tensor * v_ns;
+            if (kv.v_trans) {
+                // v_cache is transposed: create [n_kv, Dv, n_head_kv] view, then transpose+cont to [Dv, n_kv, n_head_kv]
+                v_ns = ggml_view_3d(ctx, v_cache,
+                        n_kv, n_embd_head_v, n_head_kv,
+                        ggml_element_size(v_cache)*n_cache_rows,
+                        ggml_element_size(v_cache)*n_cache_rows*n_embd_head_v,
+                        (size_t) kv_view_offset*ggml_element_size(v_cache));
+                v_ns = ggml_cont(ctx, ggml_transpose(ctx, v_ns));
+            } else {
+                // v_cache is not transposed: create [Dv, n_kv, n_head_kv] view directly
+                v_ns = ggml_view_3d(ctx, v_cache,
+                        n_embd_head_v, n_kv, n_head_kv,
+                        ggml_row_size(v_cache->type, n_embd_v_gqa),
+                        ggml_row_size(v_cache->type, n_embd_head_v),
+                        (size_t) kv_view_offset*ggml_row_size(v_cache->type, n_embd_v_gqa));
+            }
+            cb(v_ns, "v_ns", il);
+
+            cur = ggml_ns_attention(ctx, q, k, v_ns, kq_mask, kq_scale);
+            cb(cur, "ns_attend", il);
+
+            cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
+            cb(cur, "ns_attend_reshaped", il);
+        } else {
+
             // split cached v into n_head heads
-        struct ggml_tensor * v = v_cache_view ? *v_cache_view : nullptr;
+            struct ggml_tensor * v = v_cache_view ? *v_cache_view : nullptr;
         if (!v) {
             if (kv.v_trans) {
                 v = ggml_view_3d(ctx, v_cache,
@@ -2217,6 +2247,7 @@ static ggml_tensor * llm_build_kqv(
             cur = ggml_cont_2d(ctx, kqv_merged, n_embd_head_v*n_head, n_tokens);
             cb(cur, "kqv_merged_cont", il);
         }
+        } // end else (non-ns_attend)
     }
 
     ggml_build_forward_expand(graph, cur);

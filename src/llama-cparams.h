@@ -31,6 +31,7 @@ struct llama_cparams {
     bool causal_attn;
     bool offload_kqv;
     bool flash_attn;
+    bool ns_attend;
     int  mla_attn;
     int  attn_max_batch;
     bool fused_moe_up_gate;
@@ -46,6 +47,7 @@ struct llama_cparams {
     bool dsa = false;                 // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
     bool fused_idx_topk = false;      // enable the fused indexer topk op (off by default; opt-in via -fidx or --fused-indexer-topk)
     bool swa_compress = false;
+    bool kv_box       = false;  // enable KVBox KV cache mirroring (off by default; opt-in via --kv-box)
     int  dsa_top_k = -1;              // DSA top-k override (<0 => use the model's configured indexer_top_k)
     bool split_mode_graph_scheduling;
     //bool split_mode_f16;

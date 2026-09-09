@@ -420,6 +420,7 @@ struct gpt_params {
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool flash_attn        = true;  // flash attention
+    bool ns_attend         = false; // NSAttend sparse attention (requires flash_attn = false)
     int  mla_attn          = 3;     // MLA 0: standard, 1: MLA with K and V^T cache, 2: MLA with just K cache, 3: the best of both worlds
     int  attn_max_batch    = 256;   // Max batch size to use when computing attention (only applicable if flash_attn = false)
     bool fused_moe_up_gate = true;  // fused up*unary(gate) op for MoE models
@@ -431,6 +432,7 @@ struct gpt_params {
     bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
     bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx or --fused-indexer-topk)
     bool swa_compress      = false;
+    bool kv_box            = false; // enable KVBox KV cache mirroring (off by default; opt-in via --kv-box)
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
