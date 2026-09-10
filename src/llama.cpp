@@ -7690,6 +7690,8 @@ struct llama_context_params llama_context_default_params() {
         /*.offload_kqv                 =*/ true,
         /*.flash_attn                  =*/ true,
         /*.ns_attend                   =*/ false,
+        /*.ns_infer                    =*/ false,
+        /*.ns_infer_threshold          =*/ 0.75f,
         /*.mla_attn                    =*/ 3,
         /*.attn_max_batch              =*/ 256,
         /*.fused_moe_up_gate           =*/ true,
@@ -8182,6 +8184,8 @@ struct llama_context * llama_init_from_model(
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;
     cparams.ns_attend        = params.ns_attend;
+    cparams.ns_infer         = params.ns_infer;
+    cparams.ns_infer_threshold = params.ns_infer_threshold;
     cparams.mla_attn         = params.mla_attn;
     cparams.attn_max_batch   = params.attn_max_batch;
     cparams.fused_moe_up_gate= params.fused_moe_up_gate;
@@ -8400,7 +8404,9 @@ struct llama_context * llama_init_from_model(
     if (cparams.kv_box) {
         kv_box_full_ctx = kv_size;
         kv_size = cparams.n_batch;
-        cparams.n_ctx = kv_size;
+        // Keep cparams.n_ctx at full context size so generation isn't cut short.
+        // The working KV cache is smaller (n_batch), but KVBox mirrors writes
+        // to the compressed cache. Attention sees the working cache window.
         LLAMA_LOG_INFO("%s: KVBox mode: working KV cache reduced to %u tokens, KVBox owns %u tokens\n",
                 __func__, kv_size, kv_box_full_ctx);
     }

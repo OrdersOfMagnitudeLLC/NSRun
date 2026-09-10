@@ -4361,9 +4361,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LATENT_ATTN",
     "DS4_COMP",
     "NS_ATTENTION",
+    "NS_INFER",
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -4491,10 +4492,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "latent_attn_prefix(q,c,pk,pv,mask)",
     "ds4_comp(state, score, idx)",
     "ns_attention(q, k, v, mask, scale)",
+    "ns_infer(x, energy_threshold)",
 
 };
 
-static_assert(GGML_OP_COUNT == 112, "GGML_OP_COUNT != 112");
+static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT != 113");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -22909,7 +22911,8 @@ static void ggml_compute_forward_ns_attention(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
 
-    if (params->ith != 0) return;
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
 
     const struct ggml_tensor * q_t = dst->src[0];
     const struct ggml_tensor * k_t = dst->src[1];
@@ -22927,18 +22930,22 @@ static void ggml_compute_forward_ns_attention(
     const int64_t n_tokens = q_t->ne[1];
     const int64_t n_kv = k_t->ne[1];
 
+    // Distribute heads across threads
+    const int64_t h_start = (n_head * ith) / nth;
+    const int64_t h_end   = (n_head * (ith + 1)) / nth;
+
     const enum ggml_type q_type = q_t->type;
     const enum ggml_type k_type = k_t->type;
     const enum ggml_type v_type = v_t->type;
     const enum ggml_type m_type = mask ? mask->type : GGML_TYPE_F32;
 
-    float * scores = (float *) params->wdata;
+    float * scores = (float *)((char *)params->wdata + ith * n_kv * sizeof(float));
 
-    for (int64_t h = 0; h < n_head; h++) {
+    for (int64_t h = h_start; h < h_end; h++) {
         const int64_t hk = h * n_head_kv / n_head;
 
         // Sanity log: print first 4 values of Q, K, V raw data for the first head
-        if (h == 0) {
+        if (ith == 0 && h == h_start) {
             fprintf(stderr, "NSAttend sanity: Dk=%lld Dv=%lld n_head=%lld n_head_kv=%lld n_tokens=%lld n_kv=%lld\n",
                     (long long)Dk, (long long)Dv, (long long)n_head, (long long)n_head_kv,
                     (long long)n_tokens, (long long)n_kv);
@@ -23095,6 +23102,124 @@ static void ggml_compute_forward_ns_attention(
             }
         }
     }
+}
+
+// ggml_compute_forward_ns_infer
+
+static void ggml_compute_forward_ns_infer(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * dst) {
+    const struct ggml_tensor * src = dst->src[0];
+
+    float energy_threshold;
+    memcpy(&energy_threshold, dst->op_params, sizeof(float));
+
+    const int64_t d_ff     = src->ne[0];
+    const int64_t n_tokens = src->ne[1];
+
+    const int64_t ith = params->ith;
+    const int64_t nth = params->nth;
+
+    // Work buffer: per-thread flat_indices [d_ff ints]
+    int * flat_indices = (int *)((char *)params->wdata + ith * d_ff * sizeof(int));
+
+    // Distribute tokens across threads
+    int64_t t_start = (n_tokens * ith) / nth;
+    int64_t t_end   = (n_tokens * (ith + 1)) / nth;
+
+    for (int64_t t = t_start; t < t_end; t++) {
+        const float * s = (const float *)((const char *)src->data + t * src->nb[1]);
+        float * act = (float *)((char *)dst->data + t * dst->nb[1]);
+
+        // Copy src to dst
+        for (int64_t j = 0; j < d_ff; j++) {
+            act[j] = s[j];
+        }
+
+        float total_energy = 0.0f;
+        float max_energy = 0.0f;
+        for (int64_t j = 0; j < d_ff; j++) {
+            float e = act[j] * act[j];
+            total_energy += e;
+            if (e > max_energy) max_energy = e;
+        }
+
+        if (max_energy <= 0.0f) continue;
+
+        // Skip if activation variance is low: if max energy < 2x average,
+        // the activations are nearly uniform and zeroing would hurt quality
+        float avg_energy = total_energy / (float)d_ff;
+        if (max_energy < 2.0f * avg_energy) continue;
+
+        // NS histogram sort: 256 buckets, O(n) partial sort
+        int bucket_counts[256] = {0};
+        int bucket_starts[256] = {0};
+
+        for (int64_t j = 0; j < d_ff; j++) {
+            float e = act[j] * act[j];
+            uint8_t b = (uint8_t)(e / max_energy * 255.0f);
+            bucket_counts[b]++;
+        }
+
+        bucket_starts[255] = 0;
+        for (int b = 254; b >= 0; --b) {
+            bucket_starts[b] = bucket_starts[b + 1] + bucket_counts[b + 1];
+        }
+
+        int temp_pos[256];
+        memcpy(temp_pos, bucket_starts, sizeof(bucket_starts));
+        for (int64_t j = 0; j < d_ff; j++) {
+            float e = act[j] * act[j];
+            uint8_t b = (uint8_t)(e / max_energy * 255.0f);
+            flat_indices[temp_pos[b]++] = (int)j;
+        }
+
+        // Scan high->low, accumulate energy until threshold
+        float target_energy = energy_threshold * total_energy;
+        float cumulative_energy = 0.0f;
+        int64_t keep_count = 0;
+
+        for (int64_t i = 0; i < d_ff; i++) {
+            int j = flat_indices[i];
+            cumulative_energy += act[j] * act[j];
+            keep_count++;
+            if (cumulative_energy >= target_energy) break;
+        }
+
+        // Zero out neurons not in the keep set
+        // Mark kept indices, then zero everything else
+        char * keep_mask = (char *)(flat_indices + d_ff);
+        memset(keep_mask, 0, d_ff);
+        for (int64_t i = 0; i < keep_count; i++) {
+            keep_mask[flat_indices[i]] = 1;
+        }
+        for (int64_t j = 0; j < d_ff; j++) {
+            if (!keep_mask[j]) {
+                act[j] = 0.0f;
+            }
+        }
+    }
+}
+
+// ggml_ns_infer
+
+GGML_API struct ggml_tensor * ggml_ns_infer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        float                 energy_threshold) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+
+    // x: [d_ff, n_tokens]
+    // result: same shape
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, ggml_n_dims(x), x->ne);
+
+    float params[] = { energy_threshold };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op   = GGML_OP_NS_INFER;
+    result->src[0] = x;
+
+    return result;
 }
 
 // ggml_compute_forward_flash_attn_ext
@@ -27039,6 +27164,10 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_ns_attention(params, tensor);
             } break;
+        case GGML_OP_NS_INFER:
+            {
+                ggml_compute_forward_ns_infer(params, tensor);
+            } break;
         case GGML_OP_INDEXER_TOPK:
             {
                 if (!iqk_indexer_topk(tensor, params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, params->ith, params->nth)) {
@@ -28119,6 +28248,7 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
         case GGML_OP_NS_ATTENTION:
+        case GGML_OP_NS_INFER:
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -28869,6 +28999,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
         case GGML_OP_NS_ATTENTION:
+        case GGML_OP_NS_INFER:
             {
                 n_tasks = n_threads;
             } break;
@@ -29218,7 +29349,13 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                 } break;
             case GGML_OP_NS_ATTENTION:
                 {
-                    cur = node->src[1]->ne[1] * sizeof(float); // scores buffer
+                    cur = node->src[1]->ne[1] * sizeof(float) * n_tasks; // per-thread scores
+                } break;
+            case GGML_OP_NS_INFER:
+                {
+                    // per-thread: flat_indices (d_ff ints) + keep_mask (d_ff bytes)
+                    int64_t d_ff = node->src[0]->ne[0];
+                    cur = d_ff * (sizeof(int) + 1) * n_tasks;
                 } break;
             case GGML_OP_CROSS_ENTROPY_LOSS:
                 {

@@ -925,7 +925,7 @@ void llm_build_context::llm_build_kv_store(
     const int64_t n_head_kv     = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
 
-    GGML_ASSERT(kv.size == n_ctx);
+    GGML_ASSERT(kv.size == n_ctx || (cparams.kv_box && kv.size <= n_ctx));
 
     //struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa,
     //        (ggml_row_size(kv.k_l[il]->type, n_embd_k_gqa))*kv_head);
@@ -1189,6 +1189,10 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
             cb(cur, "ffn_up_gate", il_cb);
             *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+            if (lctx.cparams.ns_infer && il >= (int)(lctx.model.hparams.n_layer / 2)) {
+                cur = ggml_ns_infer(ctx, cur, lctx.cparams.ns_infer_threshold);
+                cb(cur, "ffn_ns_infer", il_cb);
+            }
             cur = llm_build_lora_mm(lctx, ctx, split_d, cur);
             cb(cur, "ffn_down", il_cb);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
@@ -1248,11 +1252,14 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_fused_up_gate(ctx, up, gate, cur, unary_op);
         cb(cur, "ffn_up_gate", il);
         *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
+        if (lctx.cparams.ns_infer && il >= (int)(lctx.model.hparams.n_layer / 2)) {
+            cur = ggml_ns_infer(ctx, cur, lctx.cparams.ns_infer_threshold);
+            cb(cur, "ffn_ns_infer", il);
+        }
         if (down) {
             cur = llm_build_lora_mm(lctx, ctx, down, cur);
             cb(cur, "ffn_down", il);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
-                // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
                 ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
             }
         }
@@ -1389,10 +1396,13 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     }
     }
 
+    if (lctx.cparams.ns_infer && il >= (int)(lctx.model.hparams.n_layer / 2)) {
+        cur = ggml_ns_infer(ctx, cur, lctx.cparams.ns_infer_threshold);
+        cb(cur, "ffn_ns_infer", il);
+    }
     if (down) {
         cur = llm_build_lora_mm(lctx, ctx, down, cur);
         if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
-            // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
     }
@@ -2192,7 +2202,7 @@ static ggml_tensor * llm_build_kqv(
             }
             cb(kq, "kq_soft_max_ext", il);
 
-            GGML_ASSERT(kv.size == n_ctx);
+            GGML_ASSERT(kv.size == n_ctx || (cparams.kv_box && kv.size <= n_ctx));
 
             struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);
             cb(kqv, "kqv", il);

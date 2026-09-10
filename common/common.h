@@ -421,6 +421,8 @@ struct gpt_params {
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool flash_attn        = true;  // flash attention
     bool ns_attend         = false; // NSAttend sparse attention (requires flash_attn = false)
+    bool ns_infer          = false; // NSInfer dynamic MLP sparsity (energy threshold)
+    float ns_infer_threshold = 0.75f; // NSInfer energy retention (0.75 = keep top 75% by energy)
     int  mla_attn          = 3;     // MLA 0: standard, 1: MLA with K and V^T cache, 2: MLA with just K cache, 3: the best of both worlds
     int  attn_max_batch    = 256;   // Max batch size to use when computing attention (only applicable if flash_attn = false)
     bool fused_moe_up_gate = true;  // fused up*unary(gate) op for MoE models

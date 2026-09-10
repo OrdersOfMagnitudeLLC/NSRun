@@ -815,6 +815,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_EMBEDDINGS",       params.embedding);
     get_env("LLAMA_ARG_FLASH_ATTN",       params.flash_attn);
     get_env("LLAMA_ARG_NS_ATTEND",        params.ns_attend);
+    get_env("LLAMA_ARG_NS_INFER",         params.ns_infer);
     get_env("LLAMA_ARG_DEFRAG_THOLD",     params.defrag_thold);
     get_env("LLAMA_ARG_CONT_BATCHING",    params.cont_batching);
     get_env("LLAMA_ARG_HOST",             params.hostname);
@@ -1943,6 +1944,15 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     if (arg == "-nsa" || arg == "--ns-attend") {
         params.ns_attend = true;
         params.flash_attn = false;
+        return true;
+    }
+    if (arg == "-nsi" || arg == "--ns-infer") {
+        params.ns_infer = true;
+        return true;
+    }
+    if (arg == "--ns-infer-threshold") {
+        CHECK_ARG
+        params.ns_infer_threshold = std::stof(argv[i]);
         return true;
     }
     if (arg == "-mla" || arg == "--mla-use") {
@@ -3098,6 +3108,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-no-fa, --no-flash-attn",       "disable Flash Attention (default: %s)", params.flash_attn ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fa, --flash-attn (auto|on|off|0|1)", "set Flash Attention (default: %s)", params.flash_attn ? "on" : "off" });
     options.push_back({ "*",           "-nsa,  --ns-attend",            "enable NSAttend sparse attention (default: %s)", params.ns_attend ? "enabled" : "disabled" });
+    options.push_back({ "*",           "-nsi,  --ns-infer",             "enable NSInfer MLP sparsity (default: %s)", params.ns_infer ? "enabled" : "disabled" });
+    options.push_back({ "*",           "       --ns-infer-threshold F",  "NSInfer energy retention threshold (default: %.2f)", (double)params.ns_infer_threshold });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
     options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
@@ -4371,6 +4383,8 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
     cparams.ns_attend         = params.ns_attend;
+    cparams.ns_infer          = params.ns_infer;
+    cparams.ns_infer_threshold = params.ns_infer_threshold;
     cparams.mla_attn          = params.mla_attn;
     cparams.attn_max_batch    = params.attn_max_batch;
     cparams.fused_moe_up_gate = params.fused_moe_up_gate;
@@ -5423,6 +5437,7 @@ void yaml_dump_non_result_info(FILE * stream, const gpt_params & params, const l
     fprintf(stream, "cont_batching: %s # default: false\n", params.cont_batching ? "true" : "false");
     fprintf(stream, "flash_attn: %s # default: false\n", params.flash_attn ? "true" : "false");
     fprintf(stream, "ns_attend: %s # default: false\n", params.ns_attend ? "true" : "false");
+    fprintf(stream, "ns_infer: %s # default: false\n", params.ns_infer ? "true" : "false");
     fprintf(stream, "mla_attn: %d # default: 0\n", params.mla_attn);
     fprintf(stream, "attn_max_batch: %d # default: 0\n", params.attn_max_batch);
     fprintf(stream, "fused_moe: %s # default: false\n", params.fused_moe_up_gate ? "true" : "false");

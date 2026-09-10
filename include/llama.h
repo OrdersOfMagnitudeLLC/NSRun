@@ -486,6 +486,8 @@ extern "C" {
         bool offload_kqv; // whether to offload the KQV ops (including the KV cache) to GPU
         bool flash_attn;  // whether to use flash attention [EXPERIMENTAL]
         bool ns_attend;   // whether to use NSAttend sparse attention [EXPERIMENTAL]
+        bool ns_infer;    // whether to use NSInfer MLP sparsity [EXPERIMENTAL]
+        float ns_infer_threshold; // NSInfer energy retention (0.75 = keep top 75% by energy)
         int  mla_attn;    // whether to use MLA attention [EXPERIMENTAL]
         int  attn_max_batch;    // maximum batch size for attention computations [EXPERIMENTAL]
         bool fused_moe_up_gate; // whether to use fused MoE up/gate op

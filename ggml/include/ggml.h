@@ -715,6 +715,7 @@ extern "C" {
         GGML_OP_LATENT_ATTN,
         GGML_OP_DS4_COMP,
         GGML_OP_NS_ATTENTION,
+        GGML_OP_NS_INFER,
 
         GGML_OP_COUNT,
     };
@@ -2525,6 +2526,14 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * mask,
             float                 scale);
+
+    // NSInfer: dynamic MLP sparsity via energy threshold.
+    // x: [d_ff, n_tokens] — intermediate activations after gate*up (SwiGLU hidden)
+    // Returns same shape — activations with low-energy neurons zeroed
+    GGML_API struct ggml_tensor * ggml_ns_infer(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            float                 energy_threshold);
 
     // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
     // The value vector of cache row n is cache[dv_off .. dv_off+dv, n] (MLA "absorbed"
