@@ -1,3 +1,9 @@
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
+//
+// NSKVStore — INT8-quantized paged KV store with information-content eviction.
+// Part of the NSRun inference stack.
+
 #pragma once
 #include <cstdint>
 #include <cstddef>

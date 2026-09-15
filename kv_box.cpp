@@ -1,3 +1,6 @@
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
+//
 // kv_box.cpp — Bare KV allocator math validation (no inference, no LLM)
 //
 // Computes raw KV cache size for Qwen3-4B at 1M tokens, then applies

@@ -1,3 +1,9 @@
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
+//
+// KVBox — QUEST-style paged KV cold storage with content-based retrieval.
+// Part of the NSRun inference stack.
+
 #pragma once
 
 // KVBox — QUEST-style paged KV cold storage.
@@ -23,14 +29,15 @@
 #define KVBOX_PAGE_SIZE 16
 
 struct KVBoxPage {
-    // Element-wise max/min of post-RoPE K across tokens in page, per layer.
-    // Layout: [n_layers][n_kv_heads][head_dim]
+    // Element-wise max/min of post-RoPE K across tokens in page.
+    // Single-layer only (retrieval_layer = n_layers/2) to minimize storage.
+    // Layout: [n_kv_heads][head_dim]
     std::vector<ggml_fp16_t> max_k;
     std::vector<ggml_fp16_t> min_k;
-    // Sum of pre-RoPE K per (layer, head), for content-based matching.
-    // Layout: [n_layers][n_kv_heads][head_dim] — same as max_k.
-    // mean_k[l,h] = sum_k[l,h] / sum_count gives per-(layer,head) content vector.
-    std::vector<float> sum_k;
+    // Sum of pre-RoPE K per head, for content-based matching.
+    // Layout: [n_kv_heads][head_dim] — single layer, stored as fp16.
+    // mean_k[h] = sum_k[h] / sum_count gives per-head content vector.
+    std::vector<ggml_fp16_t> sum_k;
     uint32_t sum_count;
     uint32_t n_tokens;    // tokens seen in this page
     int64_t  first_pos;   // page_id * KVBOX_PAGE_SIZE
@@ -55,7 +62,7 @@ struct KVBox {
     std::unordered_map<int64_t, std::vector<ggml_fp16_t>> kv_scales;
     std::queue<int64_t> write_order;  // FIFO order for eviction
 
-    // Page scoring index: page_id → max/min K (layer 0, post-RoPE)
+    // Page scoring index: page_id → max/min/sum K (retrieval_layer only, post-RoPE)
     std::unordered_map<int64_t, KVBoxPage> pages;
 
     uint64_t writes;
@@ -131,32 +138,33 @@ struct KVBox {
     void update_page_index(int64_t pos, uint32_t layer, uint32_t head,
                            const ggml_fp16_t* k_postrope,
                            const ggml_fp16_t* k_prerope) {
-        assert(layer < n_layers);
+        // Only build scoring index for the retrieval layer (middle layer).
+        // All other layers still get K/V stored in INT8 buffer for injection.
+        if (layer != retrieval_layer) return;
         assert(head < n_kv_heads);
         int64_t page_id = pos / KVBOX_PAGE_SIZE;
         auto it = pages.find(page_id);
         if (it == pages.end()) {
             KVBoxPage pg;
-            pg.max_k.assign(n_layers * n_kv_heads * head_dim, ggml_fp32_to_fp16(-FLT_MAX));
-            pg.min_k.assign(n_layers * n_kv_heads * head_dim, ggml_fp32_to_fp16(FLT_MAX));
-            pg.sum_k.assign(n_layers * n_kv_heads * head_dim, 0.0f);
+            pg.max_k.assign(n_kv_heads * head_dim, ggml_fp32_to_fp16(-FLT_MAX));
+            pg.min_k.assign(n_kv_heads * head_dim, ggml_fp32_to_fp16(FLT_MAX));
+            pg.sum_k.assign(n_kv_heads * head_dim, ggml_fp32_to_fp16(0.0f));
             pg.sum_count = 0;
             pg.n_tokens = 0;
             pg.first_pos = page_id * KVBOX_PAGE_SIZE;
             it = pages.emplace(page_id, std::move(pg)).first;
         }
         KVBoxPage & pg = it->second;
-        size_t off = ((size_t)layer * n_kv_heads + head) * head_dim;
+        size_t off = (size_t)head * head_dim;
         ggml_fp16_t* mx = pg.max_k.data() + off;
         ggml_fp16_t* mn = pg.min_k.data() + off;
+        ggml_fp16_t* sk = pg.sum_k.data() + off;
         for (uint32_t d = 0; d < head_dim; ++d) {
             float v = ggml_fp16_to_fp32(k_postrope[d]);
             if (v > ggml_fp16_to_fp32(mx[d])) mx[d] = k_postrope[d];
             if (v < ggml_fp16_to_fp32(mn[d])) mn[d] = k_postrope[d];
-        }
-        float* sk = pg.sum_k.data() + off;
-        for (uint32_t d = 0; d < head_dim; ++d) {
-            sk[d] += ggml_fp16_to_fp32(k_prerope[d]);
+            // Accumulate pre-RoPE K as fp16 sum
+            sk[d] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(sk[d]) + ggml_fp16_to_fp32(k_prerope[d]));
         }
         pg.sum_count++;
         pg.n_tokens++;

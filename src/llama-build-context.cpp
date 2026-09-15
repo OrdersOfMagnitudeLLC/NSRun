@@ -925,6 +925,7 @@ void llm_build_context::llm_build_kv_store(
     const int64_t n_head_kv     = hparams.n_head_kv(il);
     const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
 
+    // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
     GGML_ASSERT(kv.size == n_ctx || (cparams.kv_box && kv.size <= n_ctx));
 
     //struct ggml_tensor * k_cache_view = ggml_view_1d(ctx, kv.k_l[il], n_tokens*n_embd_k_gqa,
@@ -2202,6 +2203,7 @@ static ggml_tensor * llm_build_kqv(
             }
             cb(kq, "kq_soft_max_ext", il);
 
+            // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
             GGML_ASSERT(kv.size == n_ctx || (cparams.kv_box && kv.size <= n_ctx));
 
             struct ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);

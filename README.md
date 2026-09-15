@@ -1,6 +1,17 @@
-# ik_llama.cpp: llama.cpp fork with better CPU performance
+# NSRun: NS-Enhanced LLM Inference Stack
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: OOM Commercial](https://img.shields.io/badge/license-OOM%20Commercial-red.svg)](/NS/LICENSING.md)
+
+NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp)) with four novel NS components:
+
+| Component | Function | Result |
+|---|---|---|
+| **NSKVCache** | KV compression + cross-window recall | **208.7x** compression at 1M context |
+| **NSAttend** | Attention speedup | **28.7x** at seq_len=8192 |
+| **NSInfer** | MLP sparse activation | **2.35x** MLP throughput |
+| **NSQuant** | Activation-aware quantization | Architecture complete |
+
+All NS additions are under **OOM Commercial License** — see `/NS/LICENSING.md`. Upstream llama.cpp/ik_llama code remains under its original license.
 
 ## TL;DR
 
@@ -26,9 +37,9 @@ This repository started as a fork of [llama.cpp](https://github.com/ggerganov/ll
 ### Prerequisites
 
 ```
-git clone https://github.com/ikawrakow/ik_llama.cpp
+git clone https://github.com/Fomesdise/NSRun
 
-cd ik_llama.cpp
+cd NSRun
 ```
 
 On Debian/Ubuntu Linux, install the required packages (if using another Linux distro, you need to find the corresponding packages and adapt):

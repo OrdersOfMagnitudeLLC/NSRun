@@ -1,4 +1,5 @@
 #ifdef NS_KVC
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
 #include "ns_kv_store.h"
 static NSKVStore* g_ns_kvc = nullptr;
 static void ns_kvc_ensure_init(size_t n_layers, size_t n_floats_per_kv) {
@@ -833,6 +834,7 @@ bool llama_context::update_cache_copies() {
             const size_t n_layers = (size_t)n_layer;
             const ggml_type ktype = kv_self.k_l[il]->type;
             if (ktype != GGML_TYPE_F16) {
+            // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
                 goto ns_kvc_skip;
             }
             {
@@ -1684,6 +1686,7 @@ static bool llama_kv_cache_init(
     return true;
 }
 
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
 // KVBox RoPE helper: rotate (pos>0) or un-rotate (pos<0) a K vector in-place.
 // Used to store pre-RoPE K in KVBox and re-apply RoPE at injection time.
 static void kvbox_rope_k(ggml_fp16_t * k, uint32_t head_dim,
@@ -1824,6 +1827,7 @@ static bool llama_kv_cache_find_slot(
         }
 
         if (n_tested >= cache.size) {
+            // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
             // KVBox eviction: save oldest cell's K/V to KVBox, clear it, retry
             if (lctx && lctx->cparams.kv_box && lctx->kv_box.initialized()) {
                 uint32_t evict_idx = cache.size;
@@ -6332,6 +6336,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_embd = 0;
     uint32_t n_outputs_prev_embd = 0;
 
+    // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
     const auto n_ubatch = cparams.kv_box ? (uint32_t)256 : cparams.n_ubatch;
 
     // TODO: simplify or deprecate
@@ -6717,6 +6722,7 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
+        // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
         // KVBox: mirror KV writes to KVBox buffer (store pre-RoPE K)
         if (cparams.kv_box && lctx.kv_box.initialized()) {
             const auto rope_freqs_mirror = kvbox_rope_freqs(hparams, cparams);
@@ -11915,6 +11921,7 @@ int32_t llama_decode(
 // KVBox post-prefill injection: score KVBox positions using the captured
 // retrieval_q and inject top candidates into the working KV cache.
 // Must be called after prefill completes, before the first decode token.
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
 void llama_kvbox_inject(struct llama_context * ctx) {
     if (!ctx) return;
     auto & lctx = *ctx;
@@ -11989,10 +11996,12 @@ void llama_kvbox_inject(struct llama_context * ctx) {
         scored_pages.reserve(lctx.kv_box.pages.size());
 
         const size_t k_lay_stride = (size_t)n_heads_kv * head_dim;
+        const uint32_t score_layer = lctx.kv_box.retrieval_layer;
 
-        // Build query_content_k per (layer, head): average pre-RoPE K of question tokens.
-        // Layout: [n_layers][n_kv_heads][head_dim] — same as max_k/sum_k.
-        std::vector<float> query_content_k((size_t)n_layer_kv * n_heads_kv * head_dim, 0.0f);
+        // Build query_content_k per head: average pre-RoPE K of question tokens.
+        // Single-layer only (retrieval_layer) — same as page index.
+        // Layout: [n_kv_heads][head_dim]
+        std::vector<float> query_content_k((size_t)n_heads_kv * head_dim, 0.0f);
         uint32_t qck_count = 0;
         {
             const uint32_t n_q_tok = lctx.kv_box.retrieval_q_ntok ? lctx.kv_box.retrieval_q_ntok : 1;
@@ -12000,16 +12009,14 @@ void llama_kvbox_inject(struct llama_context * ctx) {
             std::vector<ggml_fp16_t> k16(head_dim), v16(head_dim);
             for (uint32_t tq = 0; tq < n_q_tok; ++tq) {
                 int64_t tok_pos = last_pos - (int64_t)(n_q_tok - 1) + (int64_t)tq;
-                for (int il = 0; il < n_layer_kv; ++il) {
-                    for (uint32_t h_kv = 0; h_kv < n_heads_kv; ++h_kv) {
-                        if (lctx.kv_box.read_slot((uint64_t)tok_pos, il, h_kv, k16.data(), v16.data())) {
-                            size_t off = ((size_t)il * n_heads_kv + h_kv) * head_dim;
-                            float* qck = query_content_k.data() + off;
-                            for (uint32_t d = 0; d < head_dim; ++d) {
-                                qck[d] += ggml_fp16_to_fp32(k16[d]);
-                            }
-                            qck_count++;
+                for (uint32_t h_kv = 0; h_kv < n_heads_kv; ++h_kv) {
+                    if (lctx.kv_box.read_slot((uint64_t)tok_pos, score_layer, h_kv, k16.data(), v16.data())) {
+                        size_t off = (size_t)h_kv * head_dim;
+                        float* qck = query_content_k.data() + off;
+                        for (uint32_t d = 0; d < head_dim; ++d) {
+                            qck[d] += ggml_fp16_to_fp32(k16[d]);
                         }
+                        qck_count++;
                     }
                 }
             }
@@ -12017,8 +12024,8 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                 float inv = 1.0f / (float)qck_count;
                 for (size_t i = 0; i < query_content_k.size(); ++i) query_content_k[i] *= inv;
             }
-            printf("[KVBox post-prefill] query_content_k built from %u K vectors (%u tokens x %d layers x %u heads)\n",
-                   qck_count, n_q_tok, n_layer_kv, n_heads_kv);
+            printf("[KVBox post-prefill] query_content_k built from %u K vectors (%u tokens x layer %u x %u heads)\n",
+                   qck_count, n_q_tok, score_layer, n_heads_kv);
         }
 
         // Score each page: QUEST upper-bound + content cosine similarity (max over layer,head)
@@ -12037,15 +12044,16 @@ void llama_kvbox_inject(struct llama_context * ctx) {
             }
             if (!any_candidate) continue;
 
-            // QUEST score: max over (layer, head, q_token) of sum_d max(q_d*max_k_d, q_d*min_k_d)
+            // QUEST score: max over (head, q_token) of sum_d max(q_d*max_k_d, q_d*min_k_d)
+            // Single-layer only (retrieval_layer) — matches page index storage.
             const uint32_t n_q = lctx.kv_box.retrieval_q_ntok ? lctx.kv_box.retrieval_q_ntok : 1;
             const size_t q_stride = (size_t)n_heads * head_dim;
             const size_t q_lay_stride = q_stride * n_q;
             float quest_best = -1e30f;
-            for (int il = 0; il < n_layer_kv; il++) {
-                const ggml_fp16_t* mx_l = pg.max_k.data() + il * k_lay_stride;
-                const ggml_fp16_t* mn_l = pg.min_k.data() + il * k_lay_stride;
-                const float* Q_l = Q_full.data() + (size_t)il * q_lay_stride;
+            {
+                const ggml_fp16_t* mx_l = pg.max_k.data();
+                const ggml_fp16_t* mn_l = pg.min_k.data();
+                const float* Q_l = Q_full.data() + (size_t)score_layer * q_lay_stride;
                 for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
                     const ggml_fp16_t* mx = mx_l + h_kv * head_dim;
                     const ggml_fp16_t* mn = mn_l + h_kv * head_dim;
@@ -12066,29 +12074,28 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                 }
             }
 
-            // Content score: MEAN over (layer, head) of cosine(query_content_k[l,h], mean_k_page[l,h])
+            // Content score: MEAN over heads of cosine(query_content_k[h], mean_k_page[h])
+            // Single-layer (retrieval_layer), sum_k stored as fp16.
             // Skip degenerate pairs where either vector has near-zero norm.
             float content_sum = 0.0f;
             uint32_t content_n = 0;
             if (pg.sum_count > 0 && qck_count > 0) {
                 float inv_count = 1.0f / (float)pg.sum_count;
-                for (int il = 0; il < n_layer_kv; il++) {
-                    for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
-                        size_t off = ((size_t)il * n_heads_kv + h_kv) * head_dim;
-                        const float* qck = query_content_k.data() + off;
-                        const float* sk  = pg.sum_k.data() + off;
-                        float dot = 0.0f, nq = 0.0f, np = 0.0f;
-                        for (uint32_t d = 0; d < head_dim; d++) {
-                            float mean_p = sk[d] * inv_count;
-                            dot += qck[d] * mean_p;
-                            nq  += qck[d] * qck[d];
-                            np  += mean_p * mean_p;
-                        }
-                        float denom = sqrtf(nq) * sqrtf(np);
-                        if (denom > 1e-6f) {
-                            content_sum += dot / denom;
-                            content_n++;
-                        }
+                for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
+                    size_t off = (size_t)h_kv * head_dim;
+                    const float* qck = query_content_k.data() + off;
+                    const ggml_fp16_t* sk  = pg.sum_k.data() + off;
+                    float dot = 0.0f, nq = 0.0f, np = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        float mean_p = ggml_fp16_to_fp32(sk[d]) * inv_count;
+                        dot += qck[d] * mean_p;
+                        nq  += qck[d] * qck[d];
+                        np  += mean_p * mean_p;
+                    }
+                    float denom = sqrtf(nq) * sqrtf(np);
+                    if (denom > 1e-6f) {
+                        content_sum += dot / denom;
+                        content_n++;
                     }
                 }
             }

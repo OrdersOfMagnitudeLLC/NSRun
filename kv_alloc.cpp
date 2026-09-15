@@ -1,3 +1,6 @@
+// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
+//
 // kv_alloc.cpp — Bare KV allocator with actual memory (no LLM, no inference)
 //
 // Allocates the compressed KV budget, writes/reads KV pairs with dynamic-range

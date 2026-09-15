@@ -1,0 +1,48 @@
+NSRun — NSKVCache Benchmark Results
+=====================================
+OOM LLC Commercial License — see /NS/LICENSING.md
+Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
+
+Model: Qwen2.5-3B-Instruct (Q4_K_M)
+Context: 1M tokens projected
+Date: 2026-09-16
+
+--- Compression ---
+
+Raw FP16 KV:          35,156 MiB (34.33 GiB)
+KVBox total:             168.5 MiB
+  INT8 buffer:            73.1 MiB (4,096 positions, capped)
+  Page index:             95.4 MiB (62,500 pages, single-layer fp16)
+  Codebook:                0.0 MiB (0 entries)
+Compression ratio:      208.7x
+
+--- Cross-Window Recall ---
+
+Test: MANGO7734 buried at position ~855 in 1,460 tokens of lorem ipsum.
+Question: "What is the secret code?" appended at end.
+Config: -b 1024 -c 2048 --kv-box
+
+MANGO page:             Page 53 (pos 848-863)
+MANGO rank:             19 of 48 pages selected
+MANGO blended score:    0.446
+MANGO QUEST score:      203.0
+MANGO content score:    0.939
+Top lorem content:      0.888
+Model output:           "The secret code for this session is MANGO7734."
+
+--- Architecture ---
+
+Pre-RoPE K storage:     K intercepted before ggml_rope(), stored unrotated
+Page index:             16-token pages, single scoring layer (n_layers/2)
+Content matching:       cosine(query_content_k, mean_k_page) per head
+Blended scoring:        0.5 * norm_quest + 0.5 * norm_content
+Injection:              post-prefill, top-48 pages (768 tokens)
+Cold storage:           INT8 K+V, per-(layer,head) fp16 scales
+
+--- Full Stack ---
+
+NSKVCache:              208.7x KV compression + cross-window recall
+NSAttend:               28.7x attention speedup at seq_len=8192
+NSInfer:                2.35x MLP throughput, 62% fewer bytes loaded
+NSQuant:                Architecture complete
+Full stack speed:       11 tok/s vs 6.53 baseline (1.7x)
