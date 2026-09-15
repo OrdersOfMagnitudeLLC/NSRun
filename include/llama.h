@@ -1102,6 +1102,11 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // KVBox post-prefill injection: score KVBox positions using the captured
+    // retrieval_q and inject top candidates into the working KV cache.
+    // Must be called after prefill completes, before the first decode token.
+    LLAMA_API void llama_kvbox_inject(struct llama_context * ctx);
+
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)

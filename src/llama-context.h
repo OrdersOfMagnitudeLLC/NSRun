@@ -328,6 +328,9 @@ struct llama_context {
     struct llama_sampling       sampling;
     struct llama_kv_cache       kv_self;
     struct KVBox                kv_box;
+    // KVBox retrieval: tracks the last absolute position each working cache slot held
+    // before eviction, so it can be restored from KVBox on a cache miss.
+    std::vector<llama_pos>      kv_slot_abs_pos;
     struct llama_context      * mtp_target_ctx   = nullptr;
     struct llama_control_vector cvec;
 

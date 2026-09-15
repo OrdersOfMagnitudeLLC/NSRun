@@ -23211,7 +23211,7 @@ GGML_API struct ggml_tensor * ggml_ns_infer(
 
     // x: [d_ff, n_tokens]
     // result: same shape
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, ggml_n_dims(x), x->ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
 
     float params[] = { energy_threshold };
     ggml_set_op_params(result, params, sizeof(params));

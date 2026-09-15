@@ -688,6 +688,7 @@ int main(int argc, char ** argv) {
     llama_pos final_prompt_hidden_pos = -1;
     bool have_speculative_sampled = false;
     llama_token speculative_sampled = LLAMA_TOKEN_NULL;
+    bool kv_box_injected = false;
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
@@ -910,6 +911,25 @@ int main(int argc, char ** argv) {
         emitted.clear();
         embd.clear();
         embd_guidance.clear();
+
+        // KVBox post-prefill injection: inject top candidates into working KV cache,
+        // then re-evaluate the last prompt token to get logits that reflect the
+        // injected context. The first decode token is sampled from these updated logits.
+        if (params.kv_box && !kv_box_injected && (int) embd_inp.size() <= n_consumed && !embd_inp.empty()) {
+            kv_box_injected = true;
+            llama_kvbox_inject(ctx);
+
+            // Clear the last prompt token's KV cell so the slot finder can reuse it
+            llama_kv_cache_seq_rm(ctx, 0, n_past - 1, n_past);
+
+            // Re-evaluate last prompt token with injected cache to get fresh logits
+            llama_token last_token = embd_inp.back();
+            llama_batch batch = llama_batch_get_one(&last_token, 1, n_past - 1, 0);
+            if (llama_decode(ctx, batch)) {
+                LOG_TEE("%s: failed to re-eval last prefill token after KVBox injection\n", __func__);
+                return 1;
+            }
+        }
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
             if (!speculative_started) {

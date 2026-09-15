@@ -1684,13 +1684,49 @@ static bool llama_kv_cache_init(
     return true;
 }
 
+// KVBox RoPE helper: rotate (pos>0) or un-rotate (pos<0) a K vector in-place.
+// Used to store pre-RoPE K in KVBox and re-apply RoPE at injection time.
+static void kvbox_rope_k(ggml_fp16_t * k, uint32_t head_dim,
+                         int64_t pos, const std::vector<float> & rope_freqs,
+                         uint32_t n_rot) {
+    if (n_rot == 0 || n_rot > head_dim || rope_freqs.empty()) return;
+    const uint32_t n_pair = n_rot / 2;
+    const float pos_f = (float)pos;
+    for (uint32_t j = 0; j < n_pair; j++) {
+        float theta = pos_f * rope_freqs[j];
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+        float k0 = ggml_fp16_to_fp32(k[j]);
+        float k1 = ggml_fp16_to_fp32(k[j + n_pair]);
+        k[j]          = ggml_fp32_to_fp16(k0 * cos_t - k1 * sin_t);
+        k[j + n_pair] = ggml_fp32_to_fp16(k0 * sin_t + k1 * cos_t);
+    }
+}
+
+// Compute RoPE frequencies for K rotation/unrotation.
+static std::vector<float> kvbox_rope_freqs(const llama_hparams & hparams,
+                                           const llama_cparams & cparams) {
+    std::vector<float> freqs;
+    const uint32_t n_rot = hparams.n_rot;
+    if (n_rot > 0 && hparams.rope_type == LLAMA_ROPE_TYPE_NEOX) {
+        const uint32_t n_pair = n_rot / 2;
+        freqs.resize(n_pair);
+        for (uint32_t j = 0; j < n_pair; j++) {
+            freqs[j] = cparams.rope_freq_scale *
+                       powf(cparams.rope_freq_base, -2.0f * (float)j / (float)n_rot);
+        }
+    }
+    return freqs;
+}
+
 // find an empty slot of size "n_tokens" in the cache
 // updates the cache head
 // Note: On success, it's important that cache.head points
 // to the first cell of the slot.
 static bool llama_kv_cache_find_slot(
            struct llama_kv_cache & cache,
-        const struct llama_batch & batch) {
+        const struct llama_batch & batch,
+           struct llama_context * lctx = nullptr) {
     const uint32_t n_tokens = batch.n_tokens;
 
     if (cache.recurrent) {
@@ -1770,7 +1806,70 @@ static bool llama_kv_cache_find_slot(
         }
 
         if (n_tested >= cache.size) {
-            //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+            // KVBox eviction: save oldest cell's K/V to KVBox, clear it, retry
+            if (lctx && lctx->cparams.kv_box && lctx->kv_box.initialized()) {
+                uint32_t evict_idx = cache.size;
+                llama_pos min_pos = INT_MAX;
+                for (uint32_t i = 0; i < cache.size; ++i) {
+                    if (cache.cells[i].pos >= 0 && cache.cells[i].pos < min_pos) {
+                        min_pos = cache.cells[i].pos;
+                        evict_idx = i;
+                    }
+                }
+                if (evict_idx >= cache.size) return false;
+
+                // Save K/V from working cache to KVBox before clearing.
+                // Un-rotate K to pre-RoPE before storing so position isn't baked in.
+                const auto & hparams = lctx->model.hparams;
+                const auto rope_freqs = kvbox_rope_freqs(hparams, lctx->cparams);
+                const uint32_t n_rot_kv = hparams.n_rot;
+                const int n_layer_kv = lctx->model.mtp ? (int)hparams.n_layer
+                                                : (int)hparams.n_layer - (int)hparams.nextn_predict_layers;
+                for (int il = 0; il < n_layer_kv; ++il) {
+                    if (hparams.is_recurrent(il)) continue;
+                    if (il >= (int)cache.k_l.size() || !cache.k_l[il]) continue;
+                    if (cache.k_l[il]->type != GGML_TYPE_F16) continue;
+                    if (cache.k_l[il]->extra) continue;
+
+                    const size_t k_step = lctx->cache_copies[2*il+0].step;
+                    if (k_step == 0) continue;
+
+                    const uint32_t n_kv_heads = hparams.n_head_kv(il);
+                    const uint32_t head_dim   = hparams.n_embd_head_k(il);
+
+                    bool has_v = !cache.v_l.empty() && il < (int)cache.v_l.size() && cache.v_l[il];
+                    size_t v_step = 0;
+                    if (has_v) {
+                        v_step = lctx->cache_copies[2*il+1].step;
+                        if (v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) has_v = false;
+                    }
+
+                    const ggml_fp16_t* k_data = (const ggml_fp16_t*)
+                        ((char*)cache.k_l[il]->data + (size_t)evict_idx * k_step);
+                    const ggml_fp16_t* v_data = has_v ? (const ggml_fp16_t*)
+                        ((char*)cache.v_l[il]->data + (size_t)evict_idx * v_step) : nullptr;
+
+                    std::vector<ggml_fp16_t> k_pre(head_dim);
+                    for (uint32_t h = 0; h < n_kv_heads; ++h) {
+                        const ggml_fp16_t* k_head = k_data + h * head_dim;
+                        const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
+                        memcpy(k_pre.data(), k_head, head_dim * sizeof(ggml_fp16_t));
+                        kvbox_rope_k(k_pre.data(), head_dim, -(int64_t)min_pos, rope_freqs, n_rot_kv);
+                        lctx->kv_box.write_slot(min_pos, il, h, k_pre.data(), v_head);
+                    }
+                }
+
+                if (evict_idx < lctx->kv_slot_abs_pos.size()) {
+                    lctx->kv_slot_abs_pos[evict_idx] = min_pos;
+                }
+
+                cache.cells[evict_idx].pos = -1;
+                cache.cells[evict_idx].seq_id.clear();
+                cache.used--;
+                cache.head = evict_idx;
+                n_tested = 0;
+                continue;
+            }
             return false;
         }
     }
@@ -6214,7 +6313,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_embd = 0;
     uint32_t n_outputs_prev_embd = 0;
 
-    const auto n_ubatch = cparams.n_ubatch;
+    const auto n_ubatch = cparams.kv_box ? (uint32_t)256 : cparams.n_ubatch;
 
     // TODO: simplify or deprecate
     std::vector<llama_pos> pos;
@@ -6435,7 +6534,7 @@ static int llama_decode_internal(
                 kv_self.head = 0;
             }
 
-            if (!llama_kv_cache_find_slot(kv_self, u_batch)) {
+            if (!llama_kv_cache_find_slot(kv_self, u_batch, &lctx)) {
                 return 1;
             }
 
@@ -6455,13 +6554,9 @@ static int llama_decode_internal(
             }
         }
 
-#if IK_PRINT_TIMING
-        auto tim2 = ggml_time_us();
-        printf("prelude(...): %d us\n", int(tim2-tim1));
-#endif
-#if IK_PRINT_TIMING
-        tim1 = ggml_time_us();
-#endif
+        // KVBox injection is now handled externally via llama_kvbox_inject()
+        // called from the application layer after prefill completes.
+
         auto & prev = cparams.mtp_op_type == MTP_OP_NONE ? lctx.prev : lctx.prev_mtp;
         ggml_cgraph * gf = nullptr;
         const uint64_t seq_fingerprint = llama_ubatch_seq_fingerprint(u_batch, lctx.model.arch);
@@ -6603,8 +6698,10 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
-        // KVBox: mirror KV writes to compressed cache
+        // KVBox: mirror KV writes to KVBox buffer (store pre-RoPE K)
         if (cparams.kv_box && lctx.kv_box.initialized()) {
+            const auto rope_freqs_mirror = kvbox_rope_freqs(hparams, cparams);
+            const uint32_t n_rot_mirror = hparams.n_rot;
             const int n_layer_kv = model.mtp ? (int)hparams.n_layer
                                              : (int)hparams.n_layer - (int)hparams.nextn_predict_layers;
             for (int il = 0; il < n_layer_kv; ++il) {
@@ -6630,6 +6727,7 @@ static int llama_decode_internal(
                     }
                 }
 
+                std::vector<ggml_fp16_t> k_pre_mirror(head_dim);
                 for (uint32_t t = 0; t < n_tokens; ++t) {
                     const ggml_fp16_t* k_data = (const ggml_fp16_t*)
                         ((char*)kv_self.k_l[il]->data + (size_t)(cache_head + t) * k_step);
@@ -6638,14 +6736,51 @@ static int llama_decode_internal(
                         v_data = (const ggml_fp16_t*)
                             ((char*)kv_self.v_l[il]->data + (size_t)(cache_head + t) * v_step);
                     }
+                    int64_t k_pos = (int64_t)(lctx.kv_box.abs_pos + t);
                     for (uint32_t h = 0; h < n_kv_heads; ++h) {
                         const ggml_fp16_t* k_head = k_data + h * head_dim;
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
-                        lctx.kv_box.write_slot(lctx.kv_box.abs_pos + t, il, h, k_head, v_head);
+                        memcpy(k_pre_mirror.data(), k_head, head_dim * sizeof(ggml_fp16_t));
+                        kvbox_rope_k(k_pre_mirror.data(), head_dim, -k_pos, rope_freqs_mirror, n_rot_mirror);
+                        lctx.kv_box.write_slot((uint64_t)k_pos, il, h, k_pre_mirror.data(), v_head);
                     }
                 }
             }
             lctx.kv_box.abs_pos += n_tokens;
+        }
+
+        // KVBox: extract post-RoPE Q from last token after prefill only (not decode)
+        if (cparams.kv_box && lctx.kv_box.initialized() && n_tokens > 1) {
+            const uint32_t hd = hparams.n_embd_head_k(0);
+            const uint32_t n_h = hparams.n_head(0);
+
+            struct ggml_tensor * q_roped = nullptr;
+            uint32_t rope_hit = 0;
+            for (int i = 0; i < gf->n_nodes; i++) {
+                if (gf->nodes[i]->op == GGML_OP_ROPE && gf->nodes[i]->ne[1] == n_h) {
+                    if (rope_hit == lctx.kv_box.retrieval_layer) {
+                        q_roped = gf->nodes[i];
+                        break;
+                    }
+                    rope_hit++;
+                }
+            }
+            if (q_roped) {
+                const size_t q_elem = (size_t)hd * n_h;
+                const size_t offset = q_elem * (n_tokens - 1);
+                lctx.kv_box.retrieval_q.resize(q_elem);
+                lctx.kv_box.retrieval_q_pos = (int64_t)lctx.kv_box.abs_pos - 1;
+                if (q_roped->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(q_roped, lctx.kv_box.retrieval_q.data(),
+                        offset * sizeof(float), q_elem * sizeof(float));
+                } else if (q_roped->type == GGML_TYPE_F16) {
+                    std::vector<ggml_fp16_t> q_raw(q_elem);
+                    ggml_backend_tensor_get(q_roped, q_raw.data(),
+                        offset * sizeof(ggml_fp16_t), q_elem * sizeof(ggml_fp16_t));
+                    for (size_t i = 0; i < q_elem; i++)
+                        lctx.kv_box.retrieval_q[i] = ggml_fp16_to_fp32(q_raw[i]);
+                }
+            }
         }
 
         bool reset_previous = false;
@@ -6841,15 +6976,6 @@ static int llama_decode_internal(
 
     // Reset state for the next token before backend sync, to allow the CPU activities in the reset to
     // overlap with device computation.
-#if IK_PRINT_TIMING
-    auto tim1 = ggml_time_us();
-#endif
-    if (lctx.cparams.mtp_op_type == MTP_OP_NONE && !lctx.prev) {
-        ggml_backend_sched_reset(lctx.sched);
-    }
-    else if (lctx.cparams.mtp_op_type != MTP_OP_NONE && !lctx.prev_mtp) {
-        ggml_backend_sched_reset(lctx.sched);
-    }
 #if IK_PRINT_TIMING
     auto tim2 = ggml_time_us();
     printf("sched_reset(...): %d us\n", int(tim2-tim1));
@@ -8595,6 +8721,7 @@ struct llama_context * llama_init_from_model(
             const uint32_t n_kv_heads = hparams.n_head_kv(0);
             const uint32_t head_dim   = hparams.n_embd_head_k(0);
             ctx->kv_box.init(n_layer_kv, n_kv_heads, head_dim, kv_box_full_ctx);
+            ctx->kv_slot_abs_pos.assign(kv_size, -1);
             LLAMA_LOG_INFO("%s: KVBox initialized: %u layers, %u heads, %u dim, %u slots, %.2f MiB (full ctx: %u)\n",
                     __func__, n_layer_kv, n_kv_heads, head_dim, (uint32_t)ctx->kv_box.n_slots,
                     (float)ctx->kv_box.total_bytes / (1024.0f * 1024.0f), kv_box_full_ctx);
@@ -11762,6 +11889,276 @@ int32_t llama_decode(
     return ret;
 }
 
+// KVBox post-prefill injection: score KVBox positions using the captured
+// retrieval_q and inject top candidates into the working KV cache.
+// Must be called after prefill completes, before the first decode token.
+void llama_kvbox_inject(struct llama_context * ctx) {
+    if (!ctx) return;
+    auto & lctx = *ctx;
+    auto & kv_self = lctx.kv_self;
+    const auto & hparams = lctx.model.hparams;
+    const auto & cparams = lctx.cparams;
+    const auto & model = lctx.model;
+
+    if (!cparams.kv_box || !lctx.kv_box.initialized() || kv_self.recurrent) return;
+    if (lctx.kv_box.decode_injected_once) return;
+    if (lctx.kv_box.retrieval_q.empty()) return;
+
+    lctx.kv_box.decode_injected_once = true;
+
+    const uint32_t max_inject = 384;
+    const uint32_t evict_pool = 384;
+    const int n_layer_kv = model.mtp ? (int)hparams.n_layer
+                                     : (int)hparams.n_layer - (int)hparams.nextn_predict_layers;
+    const uint32_t head_dim = hparams.n_embd_head_k(0);
+    const uint32_t n_heads    = hparams.n_head(0);
+    const uint32_t n_heads_kv = hparams.n_head_kv(0);
+    const uint32_t q_per_kv   = n_heads / n_heads_kv;
+
+    // Recompute free cells and cache positions
+    std::vector<uint32_t> free_cells;
+    std::unordered_set<llama_pos> cache_pos_set;
+    for (uint32_t j = 0; j < kv_self.n; ++j) {
+        if (kv_self.cells[j].pos < 0) {
+            free_cells.push_back(j);
+        } else {
+            cache_pos_set.insert(kv_self.cells[j].pos);
+        }
+    }
+    const uint32_t n_free = (uint32_t)free_cells.size();
+
+    // Find eviction candidates (oldest cells)
+    struct CellPos { uint32_t idx; llama_pos pos; };
+    std::vector<CellPos> evict_cells;
+    if (n_free < max_inject) {
+        for (uint32_t j = 0; j < kv_self.n; ++j) {
+            llama_pos cp = kv_self.cells[j].pos;
+            if (cp >= 0) {
+                evict_cells.push_back({j, cp});
+            }
+        }
+        std::sort(evict_cells.begin(), evict_cells.end(),
+            [](const CellPos & a, const CellPos & b) { return a.pos < b.pos; });
+        uint32_t pool = std::min((uint32_t)evict_cells.size(), evict_pool);
+        evict_cells.resize(pool);
+        uint32_t n_to_evict = std::min(pool, max_inject - n_free);
+        evict_cells.resize(n_to_evict);
+    }
+    for (const auto & ec : evict_cells) {
+        cache_pos_set.erase(ec.pos);
+    }
+
+    // Get KVBox positions and build candidates
+    std::vector<int64_t> all_positions = lctx.kv_box.get_stored_positions();
+    std::vector<llama_pos> candidates;
+    for (int64_t p : all_positions) {
+        llama_pos lp = (llama_pos)p;
+        if (cache_pos_set.find(lp) == cache_pos_set.end()) {
+            candidates.push_back(lp);
+        }
+    }
+    std::sort(candidates.begin(), candidates.end());
+    lctx.kv_box.finalize_score_buffer();
+
+    // Score using retrieval_q
+    struct ScoredPos { llama_pos pos; float score; };
+    std::vector<ScoredPos> scored;
+    {
+        const std::vector<float> & Q_full = lctx.kv_box.retrieval_q;
+        const auto score_rope_freqs = kvbox_rope_freqs(hparams, cparams);
+        const uint32_t n_rot_score = hparams.n_rot;
+
+        std::vector<ggml_fp16_t> kbox_k(head_dim);
+        std::vector<float> k_head(head_dim);
+
+        for (llama_pos lp : candidates) {
+            float best_score = -1e30f;
+            bool any_hit = false;
+            for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
+                if (!lctx.kv_box.get_score_k((uint64_t)lp, h_kv, kbox_k.data())) continue;
+                any_hit = true;
+                kvbox_rope_k(kbox_k.data(), head_dim,
+                             (int64_t)lp,
+                             score_rope_freqs, n_rot_score);
+                for (uint32_t d = 0; d < head_dim; d++) {
+                    k_head[d] = ggml_fp16_to_fp32(kbox_k[d]);
+                }
+                for (uint32_t q = 0; q < q_per_kv; q++) {
+                    uint32_t h_q = h_kv * q_per_kv + q;
+                    float head_score = 0.0f;
+                    for (uint32_t d = 0; d < head_dim; d++) {
+                        head_score += Q_full[h_q * head_dim + d] * k_head[d];
+                    }
+                    if (head_score > best_score) best_score = head_score;
+                }
+            }
+            if (!any_hit) continue;
+            scored.push_back({lp, best_score});
+        }
+        std::sort(scored.begin(), scored.end(),
+            [](const ScoredPos & a, const ScoredPos & b) { return a.score > b.score; });
+    }
+
+    // Smooth scores with max-filter
+    if (!scored.empty()) {
+        const int window_radius = 24;
+        std::unordered_map<llama_pos, float> score_map;
+        score_map.reserve(scored.size() * 2);
+        for (const auto & s : scored) score_map[s.pos] = s.score;
+        for (auto & s : scored) {
+            float best = s.score;
+            for (llama_pos p = s.pos - window_radius; p <= s.pos + window_radius; ++p) {
+                auto it = score_map.find(p);
+                if (it != score_map.end() && it->second > best) best = it->second;
+            }
+            s.score = best;
+        }
+        std::sort(scored.begin(), scored.end(),
+            [](const ScoredPos & a, const ScoredPos & b) { return a.score > b.score; });
+    }
+
+    // Fallback to stride sampling if no scores
+    if (scored.empty()) {
+        uint32_t n_inject = std::min((uint32_t)candidates.size(), max_inject);
+        for (uint32_t i = 0; i < n_inject; ++i) {
+            uint32_t stride = (uint32_t)candidates.size() / n_inject;
+            if (stride == 0) stride = 1;
+            llama_pos ap = candidates[std::min(i * stride, (uint32_t)candidates.size() - 1)];
+            scored.push_back({ap, 0});
+        }
+    }
+
+    // Debug: MANGO rank
+    {
+        uint32_t n_inject_check = std::min((uint32_t)scored.size(), max_inject);
+        int mango_rank = -1;
+        for (uint32_t i = 0; i < scored.size(); i++) {
+            if (scored[i].pos >= 1205 && scored[i].pos <= 1215) {
+                if (mango_rank < 0 || (int)i < mango_rank) mango_rank = (int)i;
+                printf("[KVBox post-prefill] MANGO7734 pos=%d rank=%u %s\n",
+                       scored[i].pos, i, (i < n_inject_check) ? "INJECTED" : "not injected");
+            }
+        }
+        printf("[KVBox post-prefill] MANGO best rank: %d (need < %u) %s\n",
+               mango_rank, n_inject_check,
+               (mango_rank >= 0 && (uint32_t)mango_rank < n_inject_check) ? "INJECTED" : "NOT INJECTED");
+    }
+
+    uint32_t n_inject_capacity = std::min(n_free + (uint32_t)evict_cells.size(), max_inject);
+    printf("[KVBox post-prefill] inject capacity: %u (n_free=%u, n_evict=%zu, max_inject=%u)\n",
+           n_inject_capacity, n_free, evict_cells.size(), max_inject);
+
+    if (n_inject_capacity > 0 && !scored.empty()) {
+        std::vector<ggml_fp16_t> k_buf(head_dim);
+        std::vector<ggml_fp16_t> v_buf(head_dim);
+        const auto rope_freqs = kvbox_rope_freqs(hparams, cparams);
+        const uint32_t n_rot = hparams.n_rot;
+
+        struct InjectTarget {
+            uint32_t cell_idx;
+            llama_pos orig_pos;
+        };
+        std::vector<InjectTarget> targets;
+        for (uint32_t i = 0; i < n_free && targets.size() < n_inject_capacity; ++i) {
+            targets.push_back({free_cells[i], (llama_pos)-1});
+        }
+        for (uint32_t i = 0; i < evict_cells.size() && targets.size() < n_inject_capacity; ++i) {
+            targets.push_back({evict_cells[i].idx, evict_cells[i].pos});
+        }
+
+        uint32_t max_cell = 0;
+        for (uint32_t j = 0; j < kv_self.n; ++j) {
+            if (kv_self.cells[j].pos >= 0 && j > max_cell) max_cell = j;
+        }
+
+        for (uint32_t i = 0; i < n_inject_capacity; ++i) {
+            uint32_t cell_idx = targets[i].cell_idx;
+            llama_pos orig_pos = targets[i].orig_pos;
+            llama_pos abs_pos = scored[i].pos;
+
+            // Save evicted cell to KVBox before overwriting
+            if (orig_pos != (llama_pos)-1) {
+                for (int il = 0; il < n_layer_kv; ++il) {
+                    if (hparams.is_recurrent(il)) continue;
+                    if (il >= (int)kv_self.k_l.size() || !kv_self.k_l[il]) continue;
+                    if (kv_self.k_l[il]->type != GGML_TYPE_F16) continue;
+                    if (kv_self.k_l[il]->extra) continue;
+                    const size_t k_step = lctx.cache_copies[2*il+0].step;
+                    if (k_step == 0) continue;
+                    const uint32_t n_heads_il = hparams.n_head_kv(il);
+                    const uint32_t hdim_il    = hparams.n_embd_head_k(il);
+                    bool has_v = !kv_self.v_l.empty() && il < (int)kv_self.v_l.size() && kv_self.v_l[il];
+                    size_t v_step = 0;
+                    if (has_v) {
+                        v_step = lctx.cache_copies[2*il+1].step;
+                        if (v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
+                    }
+                    const ggml_fp16_t* ek = (const ggml_fp16_t*)
+                        ((char*)kv_self.k_l[il]->data + (size_t)cell_idx * k_step);
+                    const ggml_fp16_t* ev = has_v ? (const ggml_fp16_t*)
+                        ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step) : nullptr;
+                    std::vector<ggml_fp16_t> k_pre_evict(hdim_il);
+                    for (uint32_t h = 0; h < n_heads_il; ++h) {
+                        memcpy(k_pre_evict.data(), ek + h * hdim_il, hdim_il * sizeof(ggml_fp16_t));
+                        kvbox_rope_k(k_pre_evict.data(), hdim_il, -(int64_t)orig_pos, rope_freqs, n_rot);
+                        lctx.kv_box.write_slot((uint64_t)orig_pos, il, h,
+                            k_pre_evict.data(), ev ? ev + h * hdim_il : k_pre_evict.data());
+                    }
+                }
+            }
+
+            // Inject from KVBox into working cache
+            bool any_hit = false;
+            for (int il = 0; il < n_layer_kv; ++il) {
+                if (hparams.is_recurrent(il)) continue;
+                if (il >= (int)kv_self.k_l.size() || !kv_self.k_l[il]) continue;
+                if (kv_self.k_l[il]->type != GGML_TYPE_F16) continue;
+                if (kv_self.k_l[il]->extra) continue;
+                const size_t k_step = lctx.cache_copies[2*il+0].step;
+                if (k_step == 0) continue;
+                const uint32_t n_heads_il = hparams.n_head_kv(il);
+                const uint32_t hdim_il    = hparams.n_embd_head_k(il);
+                bool has_v = !kv_self.v_l.empty() && il < (int)kv_self.v_l.size() && kv_self.v_l[il];
+                size_t v_step = 0;
+                if (has_v) {
+                    v_step = lctx.cache_copies[2*il+1].step;
+                    if (v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
+                }
+                for (uint32_t h = 0; h < n_heads_il; ++h) {
+                    if (!lctx.kv_box.read_slot((uint64_t)abs_pos, il, h, k_buf.data(), v_buf.data())) continue;
+                    any_hit = true;
+                    kvbox_rope_k(k_buf.data(), hdim_il, (int64_t)abs_pos, rope_freqs, n_rot);
+                    ggml_fp16_t* dk = (ggml_fp16_t*)
+                        ((char*)kv_self.k_l[il]->data + (size_t)cell_idx * k_step + h * hdim_il * sizeof(ggml_fp16_t));
+                    memcpy(dk, k_buf.data(), hdim_il * sizeof(ggml_fp16_t));
+                    if (has_v) {
+                        ggml_fp16_t* dv = (ggml_fp16_t*)
+                            ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step + h * hdim_il * sizeof(ggml_fp16_t));
+                        memcpy(dv, v_buf.data(), hdim_il * sizeof(ggml_fp16_t));
+                    }
+                }
+            }
+
+            if (any_hit) {
+                kv_self.cells[cell_idx].pos = abs_pos;
+                kv_self.cells[cell_idx].seq_id.clear();
+                kv_self.cells[cell_idx].seq_id.insert(0);
+                lctx.kv_box.retrievals++;
+                if (cell_idx > max_cell) max_cell = cell_idx;
+            }
+        }
+
+        // Update kv_self.n to cover injected cells
+        const uint32_t pad = llama_kv_cache::get_padding(cparams.flash_attn);
+        uint32_t new_n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell + 1, pad)));
+        if (new_n > kv_self.n) {
+            kv_self.n = new_n;
+        }
+    }
+
+    lctx.kv_box.clear_score_buffer();
+}
+
 void llama_set_mtp_op_type(llama_context * ctx, llama_mtp_op_type mtp_op_type) {
     ctx->set_mtp_op_type(mtp_op_type);
 }
@@ -13022,14 +13419,21 @@ void llama_print_timings(struct llama_context * ctx) {
                 (unsigned long long)slots_used, (unsigned long long)ctx->kv_box.n_slots,
                 ctx->kv_box.n_slots ? 100.0 * slots_used / ctx->kv_box.n_slots : 0.0);
         LLAMA_LOG_INFO("%s:    total writes = %llu\n", __func__, (unsigned long long)ctx->kv_box.writes);
-        LLAMA_LOG_INFO("%s:    KVBox alloc  = %.2f MiB\n", __func__,
+        LLAMA_LOG_INFO("%s:    retrievals   = %llu\n", __func__, (unsigned long long)ctx->kv_box.retrievals);
+        LLAMA_LOG_INFO("%s:    prefill retr= %llu\n", __func__, (unsigned long long)ctx->kv_box.prefill_retrievals);
+        LLAMA_LOG_INFO("%s:    KVBox slots  = %.2f MiB\n", __func__,
                 (float)ctx->kv_box.total_bytes / (1024.0f * 1024.0f));
+        LLAMA_LOG_INFO("%s:    codebook     = %llu entries, %.2f MiB\n", __func__,
+                (unsigned long long)ctx->kv_box.codebook_total_entries(),
+                (float)ctx->kv_box.codebook_bytes() / (1024.0f * 1024.0f));
+        LLAMA_LOG_INFO("%s:    KVBox total  = %.2f MiB\n", __func__,
+                (float)(ctx->kv_box.total_bytes + ctx->kv_box.codebook_bytes()) / (1024.0f * 1024.0f));
         LLAMA_LOG_INFO("%s:    working KV   = %.2f MiB (%u tokens)\n", __func__,
                 (float)ik_kv_bytes / (1024.0f * 1024.0f), (uint32_t)ctx->kv_self.size);
         LLAMA_LOG_INFO("%s:    full ctx KV  = %.2f MiB (%llu tokens)\n", __func__,
                 (float)full_kv_bytes / (1024.0f * 1024.0f), (unsigned long long)ctx->kv_box.n_tokens);
         LLAMA_LOG_INFO("%s:    compression  = %.2fx\n", __func__,
-                full_kv_bytes > 0 ? (double)full_kv_bytes / (double)ctx->kv_box.total_bytes : 0.0);
+                full_kv_bytes > 0 ? (double)full_kv_bytes / (double)(ctx->kv_box.total_bytes + ctx->kv_box.codebook_bytes()) : 0.0);
     }
 }
 
