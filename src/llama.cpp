@@ -1719,6 +1719,24 @@ static std::vector<float> kvbox_rope_freqs(const llama_hparams & hparams,
     return freqs;
 }
 
+// Float variant of kvbox_rope_k for un-rotating Q vectors.
+static void kvbox_rope_f(float * q, uint32_t head_dim,
+                         int64_t pos, const std::vector<float> & rope_freqs,
+                         uint32_t n_rot) {
+    if (n_rot == 0 || n_rot > head_dim || rope_freqs.empty()) return;
+    const uint32_t n_pair = n_rot / 2;
+    const float pos_f = (float)pos;
+    for (uint32_t j = 0; j < n_pair; j++) {
+        float theta = pos_f * rope_freqs[j];
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+        float q0 = q[j];
+        float q1 = q[j + n_pair];
+        q[j]          = q0 * cos_t - q1 * sin_t;
+        q[j + n_pair] = q0 * sin_t + q1 * cos_t;
+    }
+}
+
 // find an empty slot of size "n_tokens" in the cache
 // updates the cache head
 // Note: On success, it's important that cache.head points
@@ -1855,6 +1873,7 @@ static bool llama_kv_cache_find_slot(
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
                         memcpy(k_pre.data(), k_head, head_dim * sizeof(ggml_fp16_t));
                         kvbox_rope_k(k_pre.data(), head_dim, -(int64_t)min_pos, rope_freqs, n_rot_kv);
+                        lctx->kv_box.update_page_index(min_pos, il, h, k_head, k_pre.data());
                         lctx->kv_box.write_slot(min_pos, il, h, k_pre.data(), v_head);
                     }
                 }
@@ -6742,6 +6761,7 @@ static int llama_decode_internal(
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
                         memcpy(k_pre_mirror.data(), k_head, head_dim * sizeof(ggml_fp16_t));
                         kvbox_rope_k(k_pre_mirror.data(), head_dim, -k_pos, rope_freqs_mirror, n_rot_mirror);
+                        lctx.kv_box.update_page_index(k_pos, il, h, k_head, k_pre_mirror.data());
                         lctx.kv_box.write_slot((uint64_t)k_pos, il, h, k_pre_mirror.data(), v_head);
                     }
                 }
@@ -6749,36 +6769,39 @@ static int llama_decode_internal(
             lctx.kv_box.abs_pos += n_tokens;
         }
 
-        // KVBox: extract post-RoPE Q from last token after prefill only (not decode)
+        // KVBox: extract post-RoPE Q for ALL layers from last N tokens after
+        // prefill only (not decode). The final token alone ("?") is a weak
+        // query; the question's content tokens carry the retrieval signal.
+        // Scoring takes the max over layers — whichever layer retrieves wins.
         if (cparams.kv_box && lctx.kv_box.initialized() && n_tokens > 1) {
             const uint32_t hd = hparams.n_embd_head_k(0);
             const uint32_t n_h = hparams.n_head(0);
+            const uint32_t n_q_tok = std::min(n_tokens, (uint32_t)8);
+            const int n_layer_q = model.mtp ? (int)hparams.n_layer
+                                            : (int)hparams.n_layer - (int)hparams.nextn_predict_layers;
 
-            struct ggml_tensor * q_roped = nullptr;
+            const size_t q_elem = (size_t)hd * n_h;
+            lctx.kv_box.retrieval_q.resize(q_elem * n_q_tok * n_layer_q);
+            lctx.kv_box.retrieval_q_ntok = n_q_tok;
+            lctx.kv_box.retrieval_q_pos = (int64_t)lctx.kv_box.abs_pos - 1;
+
             uint32_t rope_hit = 0;
-            for (int i = 0; i < gf->n_nodes; i++) {
+            for (int i = 0; i < gf->n_nodes && rope_hit < (uint32_t)n_layer_q; i++) {
                 if (gf->nodes[i]->op == GGML_OP_ROPE && gf->nodes[i]->ne[1] == n_h) {
-                    if (rope_hit == lctx.kv_box.retrieval_layer) {
-                        q_roped = gf->nodes[i];
-                        break;
+                    struct ggml_tensor * q_roped = gf->nodes[i];
+                    const size_t offset = q_elem * (n_tokens - n_q_tok);
+                    float* dst = lctx.kv_box.retrieval_q.data() + (size_t)rope_hit * q_elem * n_q_tok;
+                    if (q_roped->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(q_roped, dst,
+                            offset * sizeof(float), q_elem * n_q_tok * sizeof(float));
+                    } else if (q_roped->type == GGML_TYPE_F16) {
+                        std::vector<ggml_fp16_t> q_raw(q_elem * n_q_tok);
+                        ggml_backend_tensor_get(q_roped, q_raw.data(),
+                            offset * sizeof(ggml_fp16_t), q_elem * n_q_tok * sizeof(ggml_fp16_t));
+                        for (size_t j = 0; j < q_elem * n_q_tok; j++)
+                            dst[j] = ggml_fp16_to_fp32(q_raw[j]);
                     }
                     rope_hit++;
-                }
-            }
-            if (q_roped) {
-                const size_t q_elem = (size_t)hd * n_h;
-                const size_t offset = q_elem * (n_tokens - 1);
-                lctx.kv_box.retrieval_q.resize(q_elem);
-                lctx.kv_box.retrieval_q_pos = (int64_t)lctx.kv_box.abs_pos - 1;
-                if (q_roped->type == GGML_TYPE_F32) {
-                    ggml_backend_tensor_get(q_roped, lctx.kv_box.retrieval_q.data(),
-                        offset * sizeof(float), q_elem * sizeof(float));
-                } else if (q_roped->type == GGML_TYPE_F16) {
-                    std::vector<ggml_fp16_t> q_raw(q_elem);
-                    ggml_backend_tensor_get(q_roped, q_raw.data(),
-                        offset * sizeof(ggml_fp16_t), q_elem * sizeof(ggml_fp16_t));
-                    for (size_t i = 0; i < q_elem; i++)
-                        lctx.kv_box.retrieval_q[i] = ggml_fp16_to_fp32(q_raw[i]);
                 }
             }
         }
@@ -11906,8 +11929,12 @@ void llama_kvbox_inject(struct llama_context * ctx) {
 
     lctx.kv_box.decode_injected_once = true;
 
-    const uint32_t max_inject = 384;
-    const uint32_t evict_pool = 384;
+    // Cap injection to leave room for question tokens in the working cache.
+    // Keep at least the last 128 tokens (question + context) untouched.
+    const uint32_t n_keep_recent = 128;
+    const uint32_t working_cap = cparams.n_batch > n_keep_recent ? cparams.n_batch - n_keep_recent : cparams.n_batch;
+    const uint32_t max_inject = std::min((uint32_t)768, working_cap);
+    const uint32_t evict_pool = max_inject;
     const int n_layer_kv = model.mtp ? (int)hparams.n_layer
                                      : (int)hparams.n_layer - (int)hparams.nextn_predict_layers;
     const uint32_t head_dim = hparams.n_embd_head_k(0);
@@ -11948,77 +11975,226 @@ void llama_kvbox_inject(struct llama_context * ctx) {
         cache_pos_set.erase(ec.pos);
     }
 
-    // Get KVBox positions and build candidates
-    std::vector<int64_t> all_positions = lctx.kv_box.get_stored_positions();
-    std::vector<llama_pos> candidates;
-    for (int64_t p : all_positions) {
-        llama_pos lp = (llama_pos)p;
-        if (cache_pos_set.find(lp) == cache_pos_set.end()) {
-            candidates.push_back(lp);
-        }
-    }
-    std::sort(candidates.begin(), candidates.end());
-    lctx.kv_box.finalize_score_buffer();
-
-    // Score using retrieval_q
+    // Blended page scoring: 0.5 * normalized_QUEST + 0.5 * normalized_content
+    // QUEST = upper-bound Q . max_k/min_k score (attention-based)
+    // content = max over (layer,head) of cosine(query_content_k[l,h], mean_k_page[l,h])
     struct ScoredPos { llama_pos pos; float score; };
     std::vector<ScoredPos> scored;
+    const uint32_t max_pages = 48;
     {
         const std::vector<float> & Q_full = lctx.kv_box.retrieval_q;
-        const auto score_rope_freqs = kvbox_rope_freqs(hparams, cparams);
-        const uint32_t n_rot_score = hparams.n_rot;
 
-        std::vector<ggml_fp16_t> kbox_k(head_dim);
-        std::vector<float> k_head(head_dim);
+        struct ScoredPage { int64_t page_id; float quest_score; float content_score; float blended; };
+        std::vector<ScoredPage> scored_pages;
+        scored_pages.reserve(lctx.kv_box.pages.size());
 
-        for (llama_pos lp : candidates) {
-            float best_score = -1e30f;
-            bool any_hit = false;
-            for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
-                if (!lctx.kv_box.get_score_k((uint64_t)lp, h_kv, kbox_k.data())) continue;
-                any_hit = true;
-                kvbox_rope_k(kbox_k.data(), head_dim,
-                             (int64_t)lp,
-                             score_rope_freqs, n_rot_score);
-                for (uint32_t d = 0; d < head_dim; d++) {
-                    k_head[d] = ggml_fp16_to_fp32(kbox_k[d]);
-                }
-                for (uint32_t q = 0; q < q_per_kv; q++) {
-                    uint32_t h_q = h_kv * q_per_kv + q;
-                    float head_score = 0.0f;
-                    for (uint32_t d = 0; d < head_dim; d++) {
-                        head_score += Q_full[h_q * head_dim + d] * k_head[d];
+        const size_t k_lay_stride = (size_t)n_heads_kv * head_dim;
+
+        // Build query_content_k per (layer, head): average pre-RoPE K of question tokens.
+        // Layout: [n_layers][n_kv_heads][head_dim] — same as max_k/sum_k.
+        std::vector<float> query_content_k((size_t)n_layer_kv * n_heads_kv * head_dim, 0.0f);
+        uint32_t qck_count = 0;
+        {
+            const uint32_t n_q_tok = lctx.kv_box.retrieval_q_ntok ? lctx.kv_box.retrieval_q_ntok : 1;
+            const int64_t last_pos = lctx.kv_box.retrieval_q_pos;
+            std::vector<ggml_fp16_t> k16(head_dim), v16(head_dim);
+            for (uint32_t tq = 0; tq < n_q_tok; ++tq) {
+                int64_t tok_pos = last_pos - (int64_t)(n_q_tok - 1) + (int64_t)tq;
+                for (int il = 0; il < n_layer_kv; ++il) {
+                    for (uint32_t h_kv = 0; h_kv < n_heads_kv; ++h_kv) {
+                        if (lctx.kv_box.read_slot((uint64_t)tok_pos, il, h_kv, k16.data(), v16.data())) {
+                            size_t off = ((size_t)il * n_heads_kv + h_kv) * head_dim;
+                            float* qck = query_content_k.data() + off;
+                            for (uint32_t d = 0; d < head_dim; ++d) {
+                                qck[d] += ggml_fp16_to_fp32(k16[d]);
+                            }
+                            qck_count++;
+                        }
                     }
-                    if (head_score > best_score) best_score = head_score;
                 }
             }
-            if (!any_hit) continue;
-            scored.push_back({lp, best_score});
-        }
-        std::sort(scored.begin(), scored.end(),
-            [](const ScoredPos & a, const ScoredPos & b) { return a.score > b.score; });
-    }
-
-    // Smooth scores with max-filter
-    if (!scored.empty()) {
-        const int window_radius = 24;
-        std::unordered_map<llama_pos, float> score_map;
-        score_map.reserve(scored.size() * 2);
-        for (const auto & s : scored) score_map[s.pos] = s.score;
-        for (auto & s : scored) {
-            float best = s.score;
-            for (llama_pos p = s.pos - window_radius; p <= s.pos + window_radius; ++p) {
-                auto it = score_map.find(p);
-                if (it != score_map.end() && it->second > best) best = it->second;
+            if (qck_count > 0) {
+                float inv = 1.0f / (float)qck_count;
+                for (size_t i = 0; i < query_content_k.size(); ++i) query_content_k[i] *= inv;
             }
-            s.score = best;
+            printf("[KVBox post-prefill] query_content_k built from %u K vectors (%u tokens x %d layers x %u heads)\n",
+                   qck_count, n_q_tok, n_layer_kv, n_heads_kv);
+        }
+
+        // Score each page: QUEST upper-bound + content cosine similarity (max over layer,head)
+        for (const auto & kv : lctx.kv_box.pages) {
+            const KVBoxPage & pg = kv.second;
+            if (pg.max_k.empty() || pg.min_k.empty()) continue;
+            int64_t base = kv.first * KVBOX_PAGE_SIZE;
+            bool any_candidate = false;
+            for (int64_t t = 0; t < KVBOX_PAGE_SIZE; ++t) {
+                llama_pos p = (llama_pos)(base + t);
+                if (cache_pos_set.find(p) == cache_pos_set.end() &&
+                    lctx.kv_box.has_position(p)) {
+                    any_candidate = true;
+                    break;
+                }
+            }
+            if (!any_candidate) continue;
+
+            // QUEST score: max over (layer, head, q_token) of sum_d max(q_d*max_k_d, q_d*min_k_d)
+            const uint32_t n_q = lctx.kv_box.retrieval_q_ntok ? lctx.kv_box.retrieval_q_ntok : 1;
+            const size_t q_stride = (size_t)n_heads * head_dim;
+            const size_t q_lay_stride = q_stride * n_q;
+            float quest_best = -1e30f;
+            for (int il = 0; il < n_layer_kv; il++) {
+                const ggml_fp16_t* mx_l = pg.max_k.data() + il * k_lay_stride;
+                const ggml_fp16_t* mn_l = pg.min_k.data() + il * k_lay_stride;
+                const float* Q_l = Q_full.data() + (size_t)il * q_lay_stride;
+                for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
+                    const ggml_fp16_t* mx = mx_l + h_kv * head_dim;
+                    const ggml_fp16_t* mn = mn_l + h_kv * head_dim;
+                    for (uint32_t q = 0; q < q_per_kv; q++) {
+                        uint32_t h_q = h_kv * q_per_kv + q;
+                        for (uint32_t tq = 0; tq < n_q; tq++) {
+                            const float* q_head = Q_l + tq * q_stride + h_q * head_dim;
+                            float s = 0.0f;
+                            for (uint32_t d = 0; d < head_dim; d++) {
+                                float qd = q_head[d];
+                                float hi = qd * ggml_fp16_to_fp32(mx[d]);
+                                float lo = qd * ggml_fp16_to_fp32(mn[d]);
+                                s += hi > lo ? hi : lo;
+                            }
+                            if (s > quest_best) quest_best = s;
+                        }
+                    }
+                }
+            }
+
+            // Content score: MEAN over (layer, head) of cosine(query_content_k[l,h], mean_k_page[l,h])
+            // Skip degenerate pairs where either vector has near-zero norm.
+            float content_sum = 0.0f;
+            uint32_t content_n = 0;
+            if (pg.sum_count > 0 && qck_count > 0) {
+                float inv_count = 1.0f / (float)pg.sum_count;
+                for (int il = 0; il < n_layer_kv; il++) {
+                    for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
+                        size_t off = ((size_t)il * n_heads_kv + h_kv) * head_dim;
+                        const float* qck = query_content_k.data() + off;
+                        const float* sk  = pg.sum_k.data() + off;
+                        float dot = 0.0f, nq = 0.0f, np = 0.0f;
+                        for (uint32_t d = 0; d < head_dim; d++) {
+                            float mean_p = sk[d] * inv_count;
+                            dot += qck[d] * mean_p;
+                            nq  += qck[d] * qck[d];
+                            np  += mean_p * mean_p;
+                        }
+                        float denom = sqrtf(nq) * sqrtf(np);
+                        if (denom > 1e-6f) {
+                            content_sum += dot / denom;
+                            content_n++;
+                        }
+                    }
+                }
+            }
+            float content_best = (content_n > 0) ? (content_sum / (float)content_n) : -1.0f;
+
+            scored_pages.push_back({kv.first, quest_best, content_best, 0.0f});
+        }
+
+        // Normalize both QUEST and content scores to [0,1] via min-max
+        float quest_min = 1e30f, quest_max = -1e30f;
+        float content_min = 1e30f, content_max = -1e30f;
+        for (const auto & sp : scored_pages) {
+            if (sp.quest_score < quest_min) quest_min = sp.quest_score;
+            if (sp.quest_score > quest_max) quest_max = sp.quest_score;
+            if (sp.content_score < content_min) content_min = sp.content_score;
+            if (sp.content_score > content_max) content_max = sp.content_score;
+        }
+        float quest_range = quest_max - quest_min;
+        if (quest_range < 1e-10f) quest_range = 1.0f;
+        float content_range = content_max - content_min;
+        if (content_range < 1e-10f) content_range = 1.0f;
+
+        // Blend: 0.5 * norm_quest + 0.5 * norm_content (both min-max normalized)
+        for (auto & sp : scored_pages) {
+            float norm_quest = (sp.quest_score - quest_min) / quest_range;
+            float norm_content = (sp.content_score - content_min) / content_range;
+            sp.blended = 0.5f * norm_quest + 0.5f * norm_content;
+        }
+
+        std::sort(scored_pages.begin(), scored_pages.end(),
+            [](const ScoredPage & a, const ScoredPage & b) { return a.blended > b.blended; });
+
+        // Debug: top scores + MANGO page (dynamic via env var KVBOX_MANGO_POS)
+        {
+            printf("[KVBox post-prefill] pages=%zu top_blended:", scored_pages.size());
+            for (uint32_t i = 0; i < scored_pages.size() && i < 8; ++i) {
+                printf(" %.3f(q=%.1f,c=%.3f@p%lld)", scored_pages[i].blended,
+                       scored_pages[i].quest_score, scored_pages[i].content_score,
+                       (long long)(scored_pages[i].page_id * KVBOX_PAGE_SIZE));
+            }
+            printf("\n");
+            int64_t mango_pos = -1;
+            if (const char* env = getenv("KVBOX_MANGO_POS")) mango_pos = atoll(env);
+            int mango_page_rank = -1;
+            for (uint32_t i = 0; i < scored_pages.size(); i++) {
+                int64_t base = scored_pages[i].page_id * KVBOX_PAGE_SIZE;
+                if (mango_pos >= 0 && base <= mango_pos && base + KVBOX_PAGE_SIZE > mango_pos) {
+                    if (mango_page_rank < 0) mango_page_rank = (int)i;
+                    printf("[KVBox post-prefill] MANGO page %lld (pos %lld-%lld) rank=%u "
+                           "blended=%.3f quest=%.1f content=%.3f %s\n",
+                           (long long)scored_pages[i].page_id,
+                           (long long)base, (long long)(base + KVBOX_PAGE_SIZE - 1),
+                           i, scored_pages[i].blended,
+                           scored_pages[i].quest_score, scored_pages[i].content_score,
+                           (i < max_pages) ? "INJECTED" : "not injected");
+                }
+            }
+            // Report top non-MANGO page for content score comparison
+            for (uint32_t i = 0; i < scored_pages.size() && i < 4; ++i) {
+                int64_t base = scored_pages[i].page_id * KVBOX_PAGE_SIZE;
+                bool is_mango = (mango_pos >= 0 && base <= mango_pos && base + KVBOX_PAGE_SIZE > mango_pos);
+                if (!is_mango) {
+                    printf("[KVBox post-prefill] top-lorem page %lld (pos %lld) rank=%u "
+                           "blended=%.3f quest=%.1f content=%.3f\n",
+                           (long long)scored_pages[i].page_id,
+                           (long long)base, i,
+                           scored_pages[i].blended,
+                           scored_pages[i].quest_score, scored_pages[i].content_score);
+                    break;
+                }
+            }
+            if (mango_pos >= 0) {
+                printf("[KVBox post-prefill] MANGO page best rank: %d (need < %u) %s\n",
+                       mango_page_rank, max_pages,
+                       (mango_page_rank >= 0 && (uint32_t)mango_page_rank < max_pages) ? "INJECTED" : "NOT INJECTED");
+            }
+        }
+
+        // Expand top pages to token positions
+        for (uint32_t i = 0; i < scored_pages.size() && i < max_pages; ++i) {
+            int64_t base = scored_pages[i].page_id * KVBOX_PAGE_SIZE;
+            for (int64_t t = 0; t < KVBOX_PAGE_SIZE; ++t) {
+                llama_pos p = (llama_pos)(base + t);
+                if (cache_pos_set.find(p) == cache_pos_set.end() &&
+                    lctx.kv_box.has_position(p)) {
+                    scored.push_back({p, scored_pages[i].blended});
+                }
+            }
         }
         std::sort(scored.begin(), scored.end(),
-            [](const ScoredPos & a, const ScoredPos & b) { return a.score > b.score; });
+            [](const ScoredPos & a, const ScoredPos & b) { return a.pos < b.pos; });
     }
 
-    // Fallback to stride sampling if no scores
+
+
+    // Fallback to stride sampling if no pages scored
     if (scored.empty()) {
+        std::vector<int64_t> all_positions = lctx.kv_box.get_stored_positions();
+        std::vector<llama_pos> candidates;
+        for (int64_t p : all_positions) {
+            llama_pos lp = (llama_pos)p;
+            if (cache_pos_set.find(lp) == cache_pos_set.end()) {
+                candidates.push_back(lp);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end());
         uint32_t n_inject = std::min((uint32_t)candidates.size(), max_inject);
         for (uint32_t i = 0; i < n_inject; ++i) {
             uint32_t stride = (uint32_t)candidates.size() / n_inject;
@@ -12028,23 +12204,8 @@ void llama_kvbox_inject(struct llama_context * ctx) {
         }
     }
 
-    // Debug: MANGO rank
-    {
-        uint32_t n_inject_check = std::min((uint32_t)scored.size(), max_inject);
-        int mango_rank = -1;
-        for (uint32_t i = 0; i < scored.size(); i++) {
-            if (scored[i].pos >= 1205 && scored[i].pos <= 1215) {
-                if (mango_rank < 0 || (int)i < mango_rank) mango_rank = (int)i;
-                printf("[KVBox post-prefill] MANGO7734 pos=%d rank=%u %s\n",
-                       scored[i].pos, i, (i < n_inject_check) ? "INJECTED" : "not injected");
-            }
-        }
-        printf("[KVBox post-prefill] MANGO best rank: %d (need < %u) %s\n",
-               mango_rank, n_inject_check,
-               (mango_rank >= 0 && (uint32_t)mango_rank < n_inject_check) ? "INJECTED" : "NOT INJECTED");
-    }
-
     uint32_t n_inject_capacity = std::min(n_free + (uint32_t)evict_cells.size(), max_inject);
+    n_inject_capacity = std::min(n_inject_capacity, (uint32_t)scored.size());
     printf("[KVBox post-prefill] inject capacity: %u (n_free=%u, n_evict=%zu, max_inject=%u)\n",
            n_inject_capacity, n_free, evict_cells.size(), max_inject);
 

@@ -1,10 +1,11 @@
 #pragma once
 
-// KVBox — full-precision KV buffer for prefill-time retrieval.
-// During prefill, stores full-precision K+V for all positions.
-// After prefill, scores all positions using retrieval_q, injects top-N
-// into working cache, then discards the buffer.
-// No cold storage, no codebook, no compression.
+// KVBox — QUEST-style paged KV cold storage.
+// During prefill/eviction, stores per-token K+V at INT8 and maintains a
+// per-page (16 tokens) scoring index: element-wise max/min of post-RoPE
+// layer-0 K (FP16). Post-prefill, pages are scored with the QUEST bound
+// score = sum_d max(q_d*max_k_d, q_d*min_k_d); top-24 pages (384 tokens)
+// are injected into the working cache.
 
 #include "ggml.h"
 
@@ -19,23 +20,43 @@
 #include <unordered_map>
 #include <queue>
 
+#define KVBOX_PAGE_SIZE 16
+
+struct KVBoxPage {
+    // Element-wise max/min of post-RoPE K across tokens in page, per layer.
+    // Layout: [n_layers][n_kv_heads][head_dim]
+    std::vector<ggml_fp16_t> max_k;
+    std::vector<ggml_fp16_t> min_k;
+    // Sum of pre-RoPE K per (layer, head), for content-based matching.
+    // Layout: [n_layers][n_kv_heads][head_dim] — same as max_k.
+    // mean_k[l,h] = sum_k[l,h] / sum_count gives per-(layer,head) content vector.
+    std::vector<float> sum_k;
+    uint32_t sum_count;
+    uint32_t n_tokens;    // tokens seen in this page
+    int64_t  first_pos;   // page_id * KVBOX_PAGE_SIZE
+};
+
 struct KVBox {
     uint32_t n_layers;
-    uint32_t group_size;  // K averaging factor for scoring (4)
+    uint32_t group_size;  // unused, kept for compat
     uint32_t n_kv_heads;
     uint32_t head_dim;
 
     uint64_t n_tokens;    // logical capacity (full context)
     uint64_t n_slots;     // = n_tokens (for compatibility)
-    size_t   per_pos_bytes; // bytes per position in buffer
+    size_t   per_pos_bytes; // bytes per position in buffer (INT8 K+V + scales)
     size_t   total_bytes;   // current buffer size
     bool     is_init;
     uint64_t max_positions; // max positions to store (bounds RAM usage)
 
-    // Full-precision KV buffer: position → [n_layers * n_kv_heads * 2 * head_dim] fp16
-    // Layout per position: [K: layer×head×dim][V: layer×head×dim]
-    std::unordered_map<int64_t, std::vector<ggml_fp16_t>> kv_buffer;
+    // Per-token INT8 K+V: pos → [n_layers][n_kv_heads][2][head_dim] int8
+    std::unordered_map<int64_t, std::vector<int8_t>> kv_buffer;
+    // Per-token scales: pos → [n_layers][n_kv_heads][2] fp16 (absmax)
+    std::unordered_map<int64_t, std::vector<ggml_fp16_t>> kv_scales;
     std::queue<int64_t> write_order;  // FIFO order for eviction
+
+    // Page scoring index: page_id → max/min K (layer 0, post-RoPE)
+    std::unordered_map<int64_t, KVBoxPage> pages;
 
     uint64_t writes;
     uint64_t retrievals;
@@ -44,6 +65,7 @@ struct KVBox {
 
     std::vector<float> retrieval_q;
     int64_t retrieval_q_pos;
+    uint32_t retrieval_q_ntok;
     bool decode_injected_once;
     uint32_t retrieval_layer;
     int32_t last_prefill_token;
@@ -54,7 +76,7 @@ struct KVBox {
         , n_tokens(0), n_slots(0), per_pos_bytes(0), total_bytes(0), is_init(false)
         , max_positions(4096)
         , writes(0), retrievals(0), prefill_retrievals(0), abs_pos(0)
-        , retrieval_q_pos(0), decode_injected_once(false), retrieval_layer(0)
+        , retrieval_q_pos(0), retrieval_q_ntok(0), decode_injected_once(false), retrieval_layer(0)
         , last_prefill_token(-1), last_prefill_pos(-1)
     {}
 
@@ -67,7 +89,9 @@ struct KVBox {
         head_dim = dim;
         n_tokens = tokens;
         n_slots = tokens;
-        per_pos_bytes = (size_t)n_layers * n_kv_heads * 2 * head_dim * sizeof(ggml_fp16_t);
+        // INT8 K+V + fp16 scales per position
+        per_pos_bytes = (size_t)n_layers * n_kv_heads * 2 * head_dim * sizeof(int8_t)
+                      + (size_t)n_layers * n_kv_heads * 2 * sizeof(ggml_fp16_t);
         total_bytes = 0;
         is_init = true;
         writes = 0;
@@ -75,11 +99,15 @@ struct KVBox {
         prefill_retrievals = 0;
         abs_pos = 0;
         decode_injected_once = false;
-        retrieval_layer = 0;
+        // Score pages at a middle layer — layer-0 attention is too diffuse
+        // for semantic retrieval; mid layers have stronger retrieval heads.
+        retrieval_layer = layers / 2;
         kv_buffer.clear();
+        kv_scales.clear();
+        pages.clear();
         while (!write_order.empty()) write_order.pop();
         // Bound buffer to avoid OOM: keep at most max_positions entries.
-        // For 36-layer 2-kv-head 128-dim model: ~36KB/pos → 4096 pos ≈ 147MB.
+        // INT8: ~18.7KB/pos for 36-layer 2-kv-head 128-dim → 4096 pos ≈ 75MB.
         max_positions = 4096;
     }
 
@@ -98,7 +126,44 @@ struct KVBox {
         return positions;
     }
 
-    // Write full-precision K and V for (token_idx, layer, head)
+    // Update page scoring index with post-RoPE K (for max/min bound) and
+    // pre-RoPE K (for content-based mean K matching).
+    void update_page_index(int64_t pos, uint32_t layer, uint32_t head,
+                           const ggml_fp16_t* k_postrope,
+                           const ggml_fp16_t* k_prerope) {
+        assert(layer < n_layers);
+        assert(head < n_kv_heads);
+        int64_t page_id = pos / KVBOX_PAGE_SIZE;
+        auto it = pages.find(page_id);
+        if (it == pages.end()) {
+            KVBoxPage pg;
+            pg.max_k.assign(n_layers * n_kv_heads * head_dim, ggml_fp32_to_fp16(-FLT_MAX));
+            pg.min_k.assign(n_layers * n_kv_heads * head_dim, ggml_fp32_to_fp16(FLT_MAX));
+            pg.sum_k.assign(n_layers * n_kv_heads * head_dim, 0.0f);
+            pg.sum_count = 0;
+            pg.n_tokens = 0;
+            pg.first_pos = page_id * KVBOX_PAGE_SIZE;
+            it = pages.emplace(page_id, std::move(pg)).first;
+        }
+        KVBoxPage & pg = it->second;
+        size_t off = ((size_t)layer * n_kv_heads + head) * head_dim;
+        ggml_fp16_t* mx = pg.max_k.data() + off;
+        ggml_fp16_t* mn = pg.min_k.data() + off;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            float v = ggml_fp16_to_fp32(k_postrope[d]);
+            if (v > ggml_fp16_to_fp32(mx[d])) mx[d] = k_postrope[d];
+            if (v < ggml_fp16_to_fp32(mn[d])) mn[d] = k_postrope[d];
+        }
+        float* sk = pg.sum_k.data() + off;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            sk[d] += ggml_fp16_to_fp32(k_prerope[d]);
+        }
+        pg.sum_count++;
+        pg.n_tokens++;
+    }
+
+    // Write INT8-quantized K and V for (token_idx, layer, head).
+    // k_f16 must be PRE-RoPE (unrotated); v_f16 is raw.
     void write_slot(uint64_t token_idx, uint32_t layer,
                     uint32_t head, const ggml_fp16_t* k_f16,
                     const ggml_fp16_t* v_f16) {
@@ -116,25 +181,60 @@ struct KVBox {
                 auto evict_it = kv_buffer.find(evict_pos);
                 if (evict_it != kv_buffer.end()) {
                     kv_buffer.erase(evict_it);
+                    kv_scales.erase(evict_pos);
                     total_bytes -= per_pos_bytes;
                 }
             }
-            kv_buffer[pos] = std::vector<ggml_fp16_t>(n_layers * n_kv_heads * 2 * head_dim, (ggml_fp16_t)0);
+            kv_buffer[pos] = std::vector<int8_t>(n_layers * n_kv_heads * 2 * head_dim, 0);
+            kv_scales[pos] = std::vector<ggml_fp16_t>(n_layers * n_kv_heads * 2, (ggml_fp16_t)0);
             write_order.push(pos);
             total_bytes += per_pos_bytes;
             it = kv_buffer.find(pos);
         }
+        auto sit = kv_scales.find(pos);
 
-        size_t k_off = (size_t)(layer * n_kv_heads + head) * head_dim;
-        memcpy(it->second.data() + k_off, k_f16, head_dim * sizeof(ggml_fp16_t));
+        // Quantize K: int8 = round(fp16 / scale), scale = absmax/127
+        {
+            float amax = 0.0f;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float a = fabsf(ggml_fp16_to_fp32(k_f16[d]));
+                if (a > amax) amax = a;
+            }
+            float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+            float inv = 1.0f / scale;
+            size_t k_off = (size_t)(layer * n_kv_heads + head) * head_dim;
+            int8_t* dst = it->second.data() + k_off;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float q = ggml_fp16_to_fp32(k_f16[d]) * inv;
+                int qi = (int)lroundf(q);
+                dst[d] = (int8_t)(qi > 127 ? 127 : (qi < -127 ? -127 : qi));
+            }
+            sit->second[(layer * n_kv_heads + head) * 2 + 0] = ggml_fp32_to_fp16(scale);
+        }
 
-        size_t v_off = (size_t)(n_layers * n_kv_heads + layer * n_kv_heads + head) * head_dim;
-        memcpy(it->second.data() + v_off, v_f16, head_dim * sizeof(ggml_fp16_t));
+        // Quantize V
+        {
+            float amax = 0.0f;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float a = fabsf(ggml_fp16_to_fp32(v_f16[d]));
+                if (a > amax) amax = a;
+            }
+            float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
+            float inv = 1.0f / scale;
+            size_t v_off = (size_t)(n_layers * n_kv_heads + layer * n_kv_heads + head) * head_dim;
+            int8_t* dst = it->second.data() + v_off;
+            for (uint32_t d = 0; d < head_dim; ++d) {
+                float q = ggml_fp16_to_fp32(v_f16[d]) * inv;
+                int qi = (int)lroundf(q);
+                dst[d] = (int8_t)(qi > 127 ? 127 : (qi < -127 ? -127 : qi));
+            }
+            sit->second[(layer * n_kv_heads + head) * 2 + 1] = ggml_fp32_to_fp16(scale);
+        }
 
         writes++;
     }
 
-    // Read full-precision K and V for (token_idx, layer, head)
+    // Read dequantized K and V for (token_idx, layer, head) → fp16
     bool read_slot(uint64_t token_idx, uint32_t layer,
                    uint32_t head, ggml_fp16_t* k_f16,
                    ggml_fp16_t* v_f16) {
@@ -145,45 +245,34 @@ struct KVBox {
         int64_t pos = (int64_t)token_idx;
         auto it = kv_buffer.find(pos);
         if (it == kv_buffer.end()) return false;
+        auto sit = kv_scales.find(pos);
+        if (sit == kv_scales.end()) return false;
 
         size_t k_off = (size_t)(layer * n_kv_heads + head) * head_dim;
-        memcpy(k_f16, it->second.data() + k_off, head_dim * sizeof(ggml_fp16_t));
+        float k_scale = ggml_fp16_to_fp32(sit->second[(layer * n_kv_heads + head) * 2 + 0]);
+        const int8_t* k_src = it->second.data() + k_off;
+        for (uint32_t d = 0; d < head_dim; ++d) {
+            k_f16[d] = ggml_fp32_to_fp16((float)k_src[d] * k_scale);
+        }
 
         size_t v_off = (size_t)(n_layers * n_kv_heads + layer * n_kv_heads + head) * head_dim;
-        memcpy(v_f16, it->second.data() + v_off, head_dim * sizeof(ggml_fp16_t));
-
-        return true;
-    }
-
-    // Read averaged K for scoring: average K across first group_size layers.
-    bool get_score_k(uint64_t token_idx, uint32_t head, ggml_fp16_t* k_f16) {
-        assert(head < n_kv_heads);
-        int64_t pos = (int64_t)token_idx;
-        auto it = kv_buffer.find(pos);
-        if (it == kv_buffer.end()) return false;
-
-        uint32_t n_avg = std::min(group_size, n_layers);
-        std::vector<float> k_sum(head_dim, 0.0f);
-
-        for (uint32_t il = 0; il < n_avg; ++il) {
-            size_t k_off = (size_t)(il * n_kv_heads + head) * head_dim;
-            for (uint32_t d = 0; d < head_dim; ++d) {
-                k_sum[d] += ggml_fp16_to_fp32(it->second[k_off + d]);
-            }
-        }
-
+        float v_scale = ggml_fp16_to_fp32(sit->second[(layer * n_kv_heads + head) * 2 + 1]);
+        const int8_t* v_src = it->second.data() + v_off;
         for (uint32_t d = 0; d < head_dim; ++d) {
-            k_f16[d] = ggml_fp32_to_fp16(k_sum[d] / (float)n_avg);
+            v_f16[d] = ggml_fp32_to_fp16((float)v_src[d] * v_scale);
         }
+
         return true;
     }
 
-    // No-op: K is already full precision in the buffer
+    // No-op: page index is maintained incrementally during writes
     void finalize_score_buffer() {}
 
     // Clear the KV buffer to free memory (after injection is done)
     void clear_score_buffer() {
         kv_buffer.clear();
+        kv_scales.clear();
+        pages.clear();
         while (!write_order.empty()) write_order.pop();
         total_bytes = 0;
     }
@@ -192,12 +281,18 @@ struct KVBox {
         auto it = kv_buffer.find(pos);
         if (it == kv_buffer.end()) return;
         kv_buffer.erase(it);
+        kv_scales.erase(pos);
         total_bytes -= per_pos_bytes;
         // Note: write_order may still contain pos; it's lazily cleaned on next evict
+        // Note: page index keeps its max/min — stale entries are harmless for an upper bound
     }
 
     uint64_t slots_used_count() const {
         return (uint64_t)kv_buffer.size();
+    }
+
+    uint64_t page_count() const {
+        return (uint64_t)pages.size();
     }
 
     uint64_t codebook_total_entries() const { return 0; }
