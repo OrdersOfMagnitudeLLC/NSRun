@@ -271,6 +271,15 @@ The test suite covers parser functionality, streaming, error handling, content c
 
 Contributions in form of pull requests, issue submissions (bug reports, feature requests), or general discussions, are welcome.
 
+## Development
+
+**AI Assistance:** NSRun was developed with significant assistance from Claude (Anthropic). 
+Architecture decisions, debugging, and implementation were collaborative. 
+We believe in transparent disclosure of AI tool usage.
+
+**Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md). 
+A CLA is required before any PR merges — see [type1-toolkit](https://github.com/OrdersOfMagnitudeLLC/type1-toolkit) for the CLA process.
+
 ## License
 
 - [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
