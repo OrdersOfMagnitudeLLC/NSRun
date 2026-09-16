@@ -1,0 +1,5 @@
+#!/bin/bash
+# NSRun — NS-Enhanced LLM Inference
+# NSKVCache (208.7x compression), NSAttend, NSInfer enabled by default at build time
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$SCRIPT_DIR/build/bin/llama-cli" "$@"
