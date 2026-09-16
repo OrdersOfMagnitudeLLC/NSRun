@@ -1,6 +1,6 @@
 # NSRun: NS-Enhanced LLM Inference Stack
 
-[![License: OOM Commercial](https://img.shields.io/badge/license-OOM%20Commercial-red.svg)](/NS/LICENSING.md)
+[![License: Dual MIT/OOM](https://img.shields.io/badge/license-MIT%20%2B%20OOM%20Commercial-orange.svg)](LICENSE)
 
 NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp)) with four novel NS components:
 
@@ -11,7 +11,10 @@ NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (it
 | **NSInfer** | MLP sparse activation | **2.35x** MLP throughput |
 | **NSQuant** | Activation-aware quantization | Architecture complete |
 
-All NS additions are under **OOM Commercial License** — see `/NS/LICENSING.md`. Upstream llama.cpp/ik_llama code remains under its original license.
+## License
+
+Base engine (llama.cpp/ik_llama): MIT — see [LICENSE-MIT](LICENSE-MIT)  
+NS Additions (NSKVCache, NSAttend, NSInfer, NSQuant): OOM Commercial License — see [LICENSE-OOM](LICENSE-OOM)
 
 ## TL;DR
 
@@ -37,7 +40,7 @@ This repository started as a fork of [llama.cpp](https://github.com/ggerganov/ll
 ### Prerequisites
 
 ```
-git clone https://github.com/Fomesdise/NSRun
+git clone https://github.com/OrdersOfMagnitudeLLC/NSRun
 
 cd NSRun
 ```
