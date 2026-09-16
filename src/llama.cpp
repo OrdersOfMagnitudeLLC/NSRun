@@ -1,5 +1,5 @@
 #ifdef NS_KVC
-// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
 #include "ns_kv_store.h"
 static NSKVStore* g_ns_kvc = nullptr;
 static void ns_kvc_ensure_init(size_t n_layers, size_t n_floats_per_kv) {
@@ -834,7 +834,7 @@ bool llama_context::update_cache_copies() {
             const size_t n_layers = (size_t)n_layer;
             const ggml_type ktype = kv_self.k_l[il]->type;
             if (ktype != GGML_TYPE_F16) {
-            // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+            // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
                 goto ns_kvc_skip;
             }
             {
@@ -1686,7 +1686,7 @@ static bool llama_kv_cache_init(
     return true;
 }
 
-// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
 // KVBox RoPE helper: rotate (pos>0) or un-rotate (pos<0) a K vector in-place.
 // Used to store pre-RoPE K in KVBox and re-apply RoPE at injection time.
 static void kvbox_rope_k(ggml_fp16_t * k, uint32_t head_dim,
@@ -1827,7 +1827,7 @@ static bool llama_kv_cache_find_slot(
         }
 
         if (n_tested >= cache.size) {
-            // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+            // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
             // KVBox eviction: save oldest cell's K/V to KVBox, clear it, retry
             if (lctx && lctx->cparams.kv_box && lctx->kv_box.initialized()) {
                 uint32_t evict_idx = cache.size;
@@ -6336,7 +6336,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_embd = 0;
     uint32_t n_outputs_prev_embd = 0;
 
-    // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+    // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
     const auto n_ubatch = cparams.kv_box ? (uint32_t)256 : cparams.n_ubatch;
 
     // TODO: simplify or deprecate
@@ -6722,7 +6722,7 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
 
-        // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+        // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
         // KVBox: mirror KV writes to KVBox buffer (store pre-RoPE K)
         if (cparams.kv_box && lctx.kv_box.initialized()) {
             const auto rope_freqs_mirror = kvbox_rope_freqs(hparams, cparams);
@@ -11921,7 +11921,7 @@ int32_t llama_decode(
 // KVBox post-prefill injection: score KVBox positions using the captured
 // retrieval_q and inject top candidates into the working KV cache.
 // Must be called after prefill completes, before the first decode token.
-// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
 void llama_kvbox_inject(struct llama_context * ctx) {
     if (!ctx) return;
     auto & lctx = *ctx;

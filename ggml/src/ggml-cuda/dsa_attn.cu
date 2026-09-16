@@ -44,7 +44,7 @@ static __global__ void k_prepare_one_batch_kv_q8_0(int nk, int ncol, const int *
     auto k_row = (const block_q8_0 *)(k_in + stride_k * i);
     k_out += (row*ncol + col)*nk;
     for (int j = threadIdx.x; j < nk; j += blockDim.x) {
-        k_out[j] = k_row[j/32].d * (half)k_row[j/32].qs[j%32];
+        k_out[j] = __float2half((float)k_row[j/32].d * (float)k_row[j/32].qs[j%32]);
     }
 }
 

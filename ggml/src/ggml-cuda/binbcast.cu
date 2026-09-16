@@ -347,7 +347,7 @@ static __global__ void k_add_same(int64_t nelem, const data_t * x, const data_t 
         z[i] = __float2bfloat16((float)x[i] + (float)y[i]);
 #endif
     } else {
-        z[i] = x[i] + y[i];
+        z[i] = (data_t)((float)x[i] + (float)y[i]);
     }
 }
 

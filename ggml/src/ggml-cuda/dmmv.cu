@@ -31,13 +31,13 @@ static __device__ __forceinline__ void trellis_accum(uint32_t& val1, uint32_t& v
     s[2] = trellis_next(val2);
     s[3] = trellis_next(val2);
 #ifdef GGML_CUDA_F16
-    bdot1 = __hfma2(y[ 0], {h[0]+h[1], h[2]+h[3]}, bdot1);
-    bdot2 = __hfma2(y[64], {h[4]+h[5], h[6]+h[7]}, bdot2);
+    bdot1 = __hfma2(y[ 0], {__float2half((float)h[0] + (float)h[1]), __float2half((float)h[2] + (float)h[3])}, bdot1);
+    bdot2 = __hfma2(y[64], {__float2half((float)h[4] + (float)h[5]), __float2half((float)h[6] + (float)h[7])}, bdot2);
 #else
-    bdot1.x += y[ 0].x * (float)(h[0] + h[1]);
-    bdot1.y += y[ 0].y * (float)(h[2] + h[3]);
-    bdot2.x += y[64].x * (float)(h[4] + h[5]);
-    bdot2.y += y[64].y * (float)(h[6] + h[7]);
+    bdot1.x += y[ 0].x * (float)h[0] + (float)h[1];
+    bdot1.y += y[ 0].y * (float)h[2] + (float)h[3];
+    bdot2.x += y[64].x * (float)h[4] + (float)h[5];
+    bdot2.y += y[64].y * (float)h[6] + (float)h[7];
 #endif
 }
 
@@ -49,17 +49,17 @@ static __device__ __forceinline__ void trellis_accum_abs(uint8_t signs1, uint8_t
     s[2] = trellis_next(val2);
     s[3] = trellis_next(val2);
 #ifdef GGML_CUDA_F16
-    half h00 = __habs(h[0]+h[1]), h01 = __habs(h[2]+h[3]);
-    half h10 = __habs(h[4]+h[5]), h11 = __habs(h[6]+h[7]);
+    half h00 = __habs(__float2half((float)h[0] + (float)h[1])), h01 = __habs(__float2half((float)h[2] + (float)h[3]));
+    half h10 = __habs(__float2half((float)h[4] + (float)h[5])), h11 = __habs(__float2half((float)h[6] + (float)h[7]));
     half2 h1 = {signs1 & mask1 ? -h00 : h00, signs2 & mask1 ? -h01 : h01};
     half2 h2 = {signs1 & mask2 ? -h10 : h10, signs2 & mask2 ? -h11 : h11};
     bdot1 = __hfma2(y[ 0], h1, bdot1);
     bdot2 = __hfma2(y[64], h2, bdot2);
 #else
-    bdot1.x += y[ 0].x * fabsf((float)(h[0] + h[1])) * (signs1 & mask1 ? -1 : 1);
-    bdot1.y += y[ 0].y * fabsf((float)(h[2] + h[3])) * (signs2 & mask1 ? -1 : 1);
-    bdot2.x += y[64].x * fabsf((float)(h[4] + h[5])) * (signs1 & mask2 ? -1 : 1);
-    bdot2.y += y[64].y * fabsf((float)(h[6] + h[7])) * (signs2 & mask2 ? -1 : 1);
+    bdot1.x += y[ 0].x * fabsf((float)h[0] + (float)h[1]) * (signs1 & mask1 ? -1 : 1);
+    bdot1.y += y[ 0].y * fabsf((float)h[2] + (float)h[3]) * (signs2 & mask1 ? -1 : 1);
+    bdot2.x += y[64].x * fabsf((float)h[4] + (float)h[5]) * (signs1 & mask2 ? -1 : 1);
+    bdot2.y += y[64].y * fabsf((float)h[6] + (float)h[7]) * (signs2 & mask2 ? -1 : 1);
 #endif
 }
 

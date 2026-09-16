@@ -21,7 +21,7 @@ static __global__ void k_add(int nelem, const T * __restrict__ src, T * __restri
         dst[i] = __float2bfloat16((float)src[i] + (float)dst[i]);
 #endif
     } else {
-        dst[i] += src[i];
+        dst[i] = (T)((float)dst[i] + (float)src[i]);
     }
 }
 
@@ -46,7 +46,7 @@ template <typename T, int block_size>
 static __global__ void k_add_sym(int nelem, T * src, T * dst) {
     int i = blockIdx.x*block_size + threadIdx.x;
     if (i >= nelem) return;
-    dst[i] += src[i];
+    dst[i] = (T)((float)dst[i] + (float)src[i]);
     src[i] = dst[i];
 }
 
@@ -63,7 +63,7 @@ static __global__ void k_reduce_add(copy_task task) {
     auto dst = (T *)task.ptrs[0];
     for (int j = 1; j < task.nptr; ++j) {
         auto src = (T *)task.ptrs[j];
-        dst[i] += src[i];
+        dst[i] = (T)((float)dst[i] + (float)src[i]);
     }
     for (int j = 1; j < task.nptr; ++j) {
         auto src = (T *)task.ptrs[j];
@@ -79,7 +79,7 @@ static __global__ void k_reduce_add_T(copy_task task) {
     #pragma unroll
     for (int j = 1; j < nptr; ++j) {
         auto src = (T *)task.ptrs[j];
-        dst[i] += src[i];
+        dst[i] = (T)((float)dst[i] + (float)src[i]);
     }
     #pragma unroll
     for (int j = 1; j < nptr; ++j) {

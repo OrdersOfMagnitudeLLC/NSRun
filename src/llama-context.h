@@ -5,7 +5,7 @@
 #include "llama-sampling.h"
 
 #include "llama-spec-features.h"
-// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
 #include "kv-box.h"
 
 struct llama_model;

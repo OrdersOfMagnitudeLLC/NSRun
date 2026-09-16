@@ -266,7 +266,7 @@ static __global__ void k_indexer_mask(int ne0, int ne1, int ne2, int ntopk, int 
         __syncthreads();
         for (int j = threadIdx.x; j < ntopk; j += blockDim.x) d[i[j]] = zero;
         __syncthreads();
-        for (int j = threadIdx.x; j < ne0;   j += blockDim.x) d[j] += m[j];
+        for (int j = threadIdx.x; j < ne0;   j += blockDim.x) d[j] = (mask_t)((float)d[j] + (float)m[j]);
     } else {
         for (int j = threadIdx.x; j < ne0;   j += blockDim.x) d[j] = m[j];
     }
@@ -326,7 +326,7 @@ static __global__ void k_mask_to_index(int ne00, [[maybe_unused]] int ne0,
 
     int nOn = 0;
     for (int j = threadIdx.x; j < ne00; j += WARP_SIZE) {
-        nOn += (mask_r[j] == zero ? 1 : 0);
+        nOn += ((float)mask_r[j] == (float)zero ? 1 : 0);
     }
     counts[threadIdx.x] = nOn;
     __syncthreads();
@@ -338,7 +338,7 @@ static __global__ void k_mask_to_index(int ne00, [[maybe_unused]] int ne0,
     }
     start = cum[threadIdx.x];
     for (int j = threadIdx.x; j < ne00; j += WARP_SIZE) {
-        if (mask_r[j] == zero) idx_r[start++] = j;
+        if ((float)mask_r[j] == (float)zero) idx_r[start++] = j;
     }
 }
 

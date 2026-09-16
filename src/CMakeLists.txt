@@ -135,9 +135,9 @@ add_library(llama
             graphs/build_minimaxm3.cpp
             graphs/build_smollm3.cpp
             )
-option(GGML_NS_KVC "Enable NSKVCache compression" OFF)
+option(NS_ENABLE_KVBOX "Enable NSKVCache compression and retrieval" ON)
 
-if (GGML_NS_KVC)
+if (NS_ENABLE_KVBOX)
     target_sources(llama PRIVATE ns_kv_store.cpp)
     target_compile_definitions(llama PRIVATE NS_KVC)
 endif()

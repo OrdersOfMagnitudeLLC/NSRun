@@ -499,7 +499,7 @@ extern "C" {
         bool dsa;               // enable GLM DSA sparse attention (off by default) [EXPERIMENTAL]
         bool fused_idx_topk;    // enable the fused indexer topk op (off by default) [EXPERIMENTAL]
         bool swa_compress;      // allocate sliding-window layers at window size instead of n_ctx (off by default) [EXPERIMENTAL]
-        // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+        // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
         bool kv_box;            // enable KVBox compressed KV cache mirroring (off by default) [EXPERIMENTAL]
         int  dsa_top_k;         // DSA top-k override (<0 => model's configured indexer_top_k) [EXPERIMENTAL]
         int  min_experts;
@@ -1103,7 +1103,7 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
-    // NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+    // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
     // KVBox post-prefill injection: score KVBox positions using the captured
     // retrieval_q and inject top candidates into the working KV cache.
     LLAMA_API void llama_kvbox_inject(struct llama_context * ctx);

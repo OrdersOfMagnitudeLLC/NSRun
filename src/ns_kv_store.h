@@ -1,4 +1,4 @@
-// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
 // Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
 //
 // NSKVStore — INT8-quantized paged KV store with information-content eviction.

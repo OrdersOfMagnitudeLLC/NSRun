@@ -1,4 +1,4 @@
-// NSKVCache — OOM LLC Commercial License — see /NS/LICENSING.md
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
 // Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
 //
 // kv_box.cpp — Bare KV allocator math validation (no inference, no LLM)
