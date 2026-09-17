@@ -469,23 +469,13 @@ int main(int argc, char** argv) {
         to.n_clusters = (uint32_t)J.nc;
         to.clusters.resize(J.nc);
 
-        // Precision floor: attention and lm_head must never be Q2, and Q8 is
-        // wasted because the loader requantizes to Q4_K, so keep them at Q4.
+        // Precision floor: token_embd and the LM head (output.weight) are
+        // forced to Q8 — too sensitive for lower bits. Attention and blk.0
+        // tensors are budgeted normally (no forced override).
         if (t.name.find("token_embd") != std::string::npos ||
-            t.name.find("blk.0.") != std::string::npos ||
-            t.name.find(".attn_q.") != std::string::npos ||
-            t.name.find(".attn_k.") != std::string::npos ||
-            t.name.find(".attn_v.") != std::string::npos ||
-            t.name.find(".attn_output.") != std::string::npos) {
+            t.name == "output.weight") {
             J.min_bits = 8;
             J.max_bits = 8;
-        } else if (t.name.find("attn_q") != std::string::npos ||
-                   t.name.find("attn_k") != std::string::npos ||
-                   t.name.find("attn_v") != std::string::npos ||
-                   t.name.find("attn_output") != std::string::npos ||
-                   t.name.find("output.weight") != std::string::npos) {
-            J.min_bits = 4;
-            J.max_bits = 4;
         }
 
         // Build prompt inputs projected to n_cols once per tensor
