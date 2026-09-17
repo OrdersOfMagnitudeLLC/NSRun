@@ -42,6 +42,7 @@ enum class GGMLType : uint32_t {
     Q4_K = 12,
     Q5_K = 13,
     Q6_K = 14,
+    IQ1_S = 19,
     BF16 = 30
 };
 

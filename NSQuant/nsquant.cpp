@@ -32,8 +32,8 @@ static const size_t CLUSTER_SIZE = 256;
 // activation_freq stores each cluster's Wanda importance score:
 //   importance_ij = |W_ij| * act_norm[j],  act_norm[j] = sum_samples ||x_j||
 // Clusters are ranked globally across all tensors; the top hot_budget
-// elements -> Q8_0, bottom cold_budget -> Q2_K, rest -> Q4_K
-// (see --hot-budget/--cold-budget).
+// elements -> Q8_0, next warm_budget -> Q4_K, everything else -> IQ1_S
+// (see --hot-budget/--warm-budget).
 
 // --dequant-input: treat Q4_K/Q5_K/Q6_K/Q8_0 input tensors as dequantizable to float
 static bool g_dequant_input = false;
@@ -51,6 +51,7 @@ static uint64_t elem_offset_bytes(GGMLType ty, size_t elems) {
         case GGMLType::Q5_K: return (uint64_t)(elems / QK_K) * sizeof(block_q5_K);
         case GGMLType::Q6_K: return (uint64_t)(elems / QK_K) * sizeof(block_q6_K);
         case GGMLType::Q8_0: return (uint64_t)(elems / QK8_0) * sizeof(block_q8_0);
+        case GGMLType::IQ1_S: return (uint64_t)(elems / QK_K) * sizeof(block_iq1_s);
         default:             return (uint64_t)elems * sizeof(float);
     }
 }
@@ -231,6 +232,11 @@ static size_t quantize_to_type(const std::vector<float>& w, GGMLType ty, std::ve
             quantize_row_q2_K(w.data(), (block_q2_K*)out.data(), (int64_t)n);
             return out.size();
         }
+        case GGMLType::IQ1_S: {
+            out.resize((n / QK_K) * sizeof(block_iq1_s));
+            quantize_row_iq1_s(w.data(), out.data(), (int64_t)n);
+            return out.size();
+        }
         default:
             return 0;
     }
@@ -313,18 +319,18 @@ static std::vector<std::vector<float>> build_prompt_inputs(const BPETokenizer& t
 }
 
 int main(int argc, char** argv) {
-    long long cli_hot_budget = 500000000;
-    long long cli_cold_budget = 100000000;
+    long long cli_hot_budget = 200000000;
+    long long cli_warm_budget = 1000000000;
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--dequant-input") g_dequant_input = true;
         else if (a == "--hot-budget" && i + 1 < argc) cli_hot_budget = std::atoll(argv[++i]);
-        else if (a == "--cold-budget" && i + 1 < argc) cli_cold_budget = std::atoll(argv[++i]);
+        else if (a == "--warm-budget" && i + 1 < argc) cli_warm_budget = std::atoll(argv[++i]);
         else pos.push_back(a);
     }
     if (pos.size() < 2) {
-        std::cerr << "Usage: " << argv[0] << " [--dequant-input] [--hot-budget N] [--cold-budget N] <input.gguf> <output.gguf> [n_prompts [prompts.txt]]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [--dequant-input] [--hot-budget N] [--warm-budget N] <input.gguf> <output.gguf> [n_prompts [prompts.txt]]" << std::endl;
         return 1;
     }
     const char* in_path = pos[0].c_str();
@@ -543,13 +549,13 @@ int main(int argc, char** argv) {
     }
 
     // GLOBAL BUDGET: sort all profiled, non-forced clusters by Wanda importance.
-    // Top hot_budget elements -> Q8_0, bottom cold_budget -> Q2_K, rest -> Q4_K.
+    // Top hot_budget -> Q8_0, next warm_budget -> Q4_K, everything else -> IQ1_S.
     size_t total_params = 0;
     for (size_t ti = 0; ti < n_tensors; ++ti) {
         if (jobs[ti].quantizable) total_params += numel(parser.tensors()[ti]);
     }
-    size_t hot_budget = std::min((size_t)(total_params * 0.20), (size_t)cli_hot_budget);
-    size_t cold_budget = std::min((size_t)(total_params * 0.05), (size_t)cli_cold_budget);
+    size_t hot_budget  = std::min((size_t)(total_params * 0.05), (size_t)cli_hot_budget);
+    size_t warm_budget = std::min((size_t)(total_params * 0.25), (size_t)cli_warm_budget);
 
     struct ScoreEnt { float score; size_t ti, ci, elems; };
     std::vector<ScoreEnt> ent;
@@ -565,20 +571,19 @@ int main(int argc, char** argv) {
         }
     }
     std::sort(ent.begin(), ent.end(), [](const ScoreEnt& a, const ScoreEnt& b) { return a.score > b.score; });
-    for (auto& e : ent) outs[e.ti].clusters[e.ci].quant_bits = 4;  // warm default
+    for (auto& e : ent) outs[e.ti].clusters[e.ci].quant_bits = 2;  // cold default -> IQ1_S
     size_t acc = 0, top = 0;
     for (; top < ent.size() && acc < hot_budget; ++top) {
         acc += ent[top].elems;
         outs[ent[top].ti].clusters[ent[top].ci].quant_bits = 8;
     }
-    size_t bacc = 0;
-    for (size_t j = ent.size(); j > top && bacc < cold_budget; ) {
-        --j;
-        bacc += ent[j].elems;
-        outs[ent[j].ti].clusters[ent[j].ci].quant_bits = 2;
+    size_t wacc = 0;
+    for (size_t j = top; j < ent.size() && wacc < warm_budget; ++j) {
+        wacc += ent[j].elems;
+        outs[ent[j].ti].clusters[ent[j].ci].quant_bits = 4;
     }
     std::cout << "Budget: total_params=" << total_params
-              << " hot_budget=" << hot_budget << " cold_budget=" << cold_budget
+              << " hot_budget=" << hot_budget << " warm_budget=" << warm_budget
               << " sorted_clusters=" << ent.size() << std::endl;
 
     // Per-tensor dominant class -> output type (forced overrides via min/max_bits)
@@ -611,9 +616,9 @@ int main(int argc, char** argv) {
         else if (n_cold > n_warm && n_cold > n_hot) bits = 2;
         if (bits < J.min_bits) bits = J.min_bits;
         if (bits > J.max_bits) bits = J.max_bits;
-        GGMLType out_type = (bits == 8) ? GGMLType::Q8_0 : (bits == 2) ? GGMLType::Q2_K : GGMLType::Q4_K;
+        GGMLType out_type = (bits == 8) ? GGMLType::Q8_0 : (bits == 2) ? GGMLType::IQ1_S : GGMLType::Q4_K;
         if (out_type == GGMLType::Q8_0 && !J.q8_ok) out_type = GGMLType::F16;
-        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::Q2_K) && !J.kquant_ok)
+        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::IQ1_S) && !J.kquant_ok)
             out_type = J.q8_ok ? GGMLType::Q8_0 : GGMLType::F16;
         to.quant_type = (uint32_t)out_type;
     }
@@ -824,7 +829,7 @@ int main(int argc, char** argv) {
         std::cout << "Cluster distribution:" << std::endl;
         std::cout << "  hot  (8-bit): " << total_hot  << " (" << (100.0 * total_hot  / total_clusters) << "%)" << std::endl;
         std::cout << "  warm (4-bit): " << total_warm << " (" << (100.0 * total_warm / total_clusters) << "%)" << std::endl;
-        std::cout << "  cold (2-bit): " << total_cold << " (" << (100.0 * total_cold / total_clusters) << "%)" << std::endl;
+        std::cout << "  cold (IQ1_S): " << total_cold << " (" << (100.0 * total_cold / total_clusters) << "%)" << std::endl;
     } else if (structural_q4) {
         std::cout << "Structural Q4 pass-through; no variable-rate quantization performed." << std::endl;
     }

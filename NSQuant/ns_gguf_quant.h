@@ -10,6 +10,7 @@
 #define NS_GGUF_QUANT_H
 
 #include "ns_q4k_quant.h"  // make_qkx2_quants, nearest_int, f32_to_fp16, block_q8_0 via ns_dequant.h
+#include "vendor/iq1_s_quant.h"  // block_iq1_s, quantize_row_iq1_s (cold tier)
 
 // Q2_K block: 256 values, 2-bit quants + 4-bit packed scales/mins (84 bytes)
 typedef struct {
