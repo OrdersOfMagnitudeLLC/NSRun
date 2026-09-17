@@ -23104,6 +23104,7 @@ static void ggml_compute_forward_ns_attention(
     }
 }
 
+#ifdef NS_INFER_ENABLED
 // ggml_compute_forward_ns_infer
 
 static void ggml_compute_forward_ns_infer(
@@ -23223,6 +23224,8 @@ GGML_API struct ggml_tensor * ggml_ns_infer(
 
     return result;
 }
+
+#endif // NS_INFER_ENABLED
 
 // ggml_compute_forward_flash_attn_ext
 
@@ -27166,10 +27169,12 @@ static int ggml_compute_forward(struct ggml_compute_params * params, struct ggml
             {
                 ggml_compute_forward_ns_attention(params, tensor);
             } break;
+        #ifdef NS_INFER_ENABLED
         case GGML_OP_NS_INFER:
             {
                 ggml_compute_forward_ns_infer(params, tensor);
             } break;
+        #endif // NS_INFER_ENABLED
         case GGML_OP_INDEXER_TOPK:
             {
                 if (!iqk_indexer_topk(tensor, params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, params->ith, params->nth)) {
@@ -28250,7 +28255,9 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
         case GGML_OP_NS_ATTENTION:
+        #ifdef NS_INFER_ENABLED
         case GGML_OP_NS_INFER:
+        #endif // NS_INFER_ENABLED
             {
                 GGML_ABORT("fatal error"); // TODO: not implemented
             }
@@ -29001,7 +29008,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_LATENT_ATTN:
         case GGML_OP_DS4_COMP:
         case GGML_OP_NS_ATTENTION:
+        #ifdef NS_INFER_ENABLED
         case GGML_OP_NS_INFER:
+        #endif // NS_INFER_ENABLED
             {
                 n_tasks = n_threads;
             } break;
@@ -29353,12 +29362,14 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                 {
                     cur = node->src[1]->ne[1] * sizeof(float) * n_tasks; // per-thread scores
                 } break;
+            #ifdef NS_INFER_ENABLED
             case GGML_OP_NS_INFER:
                 {
                     // per-thread: flat_indices (d_ff ints) + keep_mask (d_ff bytes)
                     int64_t d_ff = node->src[0]->ne[0];
                     cur = d_ff * (sizeof(int) + 1) * n_tasks;
                 } break;
+            #endif // NS_INFER_ENABLED
             case GGML_OP_CROSS_ENTROPY_LOSS:
                 {
                     cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);

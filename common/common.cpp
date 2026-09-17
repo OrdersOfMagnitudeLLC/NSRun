@@ -1947,7 +1947,11 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         return true;
     }
     if (arg == "-nsi" || arg == "--ns-infer") {
+    #ifdef NS_INFER_ENABLED
         params.ns_infer = true;
+    #else
+        fprintf(stderr, "warning: --ns-infer ignored (NSInfer not compiled in; rebuild with -DNS_INFER_ENABLED)\n");
+    #endif // NS_INFER_ENABLED
         return true;
     }
     if (arg == "--ns-infer-threshold") {

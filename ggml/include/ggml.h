@@ -2530,10 +2530,12 @@ extern "C" {
     // NSInfer: dynamic MLP sparsity via energy threshold.
     // x: [d_ff, n_tokens] — intermediate activations after gate*up (SwiGLU hidden)
     // Returns same shape — activations with low-energy neurons zeroed
+    #ifdef NS_INFER_ENABLED
     GGML_API struct ggml_tensor * ggml_ns_infer(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
             float                 energy_threshold);
+    #endif // NS_INFER_ENABLED
 
     // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
     // The value vector of cache row n is cache[dv_off .. dv_off+dv, n] (MLA "absorbed"

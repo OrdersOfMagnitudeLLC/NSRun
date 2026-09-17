@@ -8,7 +8,7 @@ NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (it
 |---|---|---|
 | **NSKVCache** | KV compression + cross-window recall | **208.7x** compression at 1M context |
 | **NSAttend** | Attention speedup | **28.7x** at seq_len=8192 |
-| **NSInfer** | MLP sparse activation | **2.35x** MLP throughput |
+| **NSInfer** | MLP sparse activation | Standalone benchmark proven **3.04x**; ik_llama integration WIP (compute path behind `-DNS_INFER_ENABLED`, default off) |
 | **NSQuant** | Activation-aware quantization | Architecture complete |
 
 ## License

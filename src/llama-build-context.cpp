@@ -1190,10 +1190,12 @@ ggml_tensor * llm_build_context::llm_build_ffn(
             cur = ggml_fused_up_gate(ctx, split_u, split_g, cur, unary_op);
             cb(cur, "ffn_up_gate", il_cb);
             *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, lctx.model.arch == LLM_ARCH_BAILINGMOE3);
+            #ifdef NS_INFER_ENABLED
             if (lctx.cparams.ns_infer && il >= (int)(lctx.model.hparams.n_layer / 2)) {
                 cur = ggml_ns_infer(ctx, cur, lctx.cparams.ns_infer_threshold);
                 cb(cur, "ffn_ns_infer", il_cb);
             }
+            #endif // NS_INFER_ENABLED
             cur = llm_build_lora_mm(lctx, ctx, split_d, cur);
             cb(cur, "ffn_down", il_cb);
             if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {
@@ -1253,10 +1255,12 @@ ggml_tensor * llm_build_context::llm_build_ffn(
         cur = ggml_fused_up_gate(ctx, up, gate, cur, unary_op);
         cb(cur, "ffn_up_gate", il);
         *(float *)(cur->op_params + 1) = lctx.model.swiglu_limit(il, true);
+        #ifdef NS_INFER_ENABLED
         if (lctx.cparams.ns_infer && il >= (int)(lctx.model.hparams.n_layer / 2)) {
             cur = ggml_ns_infer(ctx, cur, lctx.cparams.ns_infer_threshold);
             cb(cur, "ffn_ns_infer", il);
         }
+        #endif // NS_INFER_ENABLED
         if (down) {
             cur = llm_build_lora_mm(lctx, ctx, down, cur);
             cb(cur, "ffn_down", il);
@@ -1397,10 +1401,12 @@ ggml_tensor * llm_build_context::llm_build_ffn(
     }
     }
 
+    #ifdef NS_INFER_ENABLED
     if (lctx.cparams.ns_infer && il >= (int)(lctx.model.hparams.n_layer / 2)) {
         cur = ggml_ns_infer(ctx, cur, lctx.cparams.ns_infer_threshold);
         cb(cur, "ffn_ns_infer", il);
     }
+    #endif // NS_INFER_ENABLED
     if (down) {
         cur = llm_build_lora_mm(lctx, ctx, down, cur);
         if (lctx.model.arch == LLM_ARCH_GLM4 || lctx.model.arch == LLM_ARCH_GLM4_MOE) {

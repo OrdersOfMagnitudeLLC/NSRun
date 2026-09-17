@@ -1,0 +1,9 @@
+*.o
+*.nsm
+*.gguf
+nsquant
+CMakeCache.txt
+CMakeFiles/
+Makefile
+cmake_install.cmake
+build/
