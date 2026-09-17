@@ -33,11 +33,11 @@ static const size_t CLUSTER_SIZE = 256;
 // ranked globally across all tensors; the top hot_budget elements -> Q8_0,
 // bottom cold_budget -> Q2_K, rest -> Q4_K (see --hot-budget/--cold-budget).
 
-// --dequant-input: treat Q4_K/Q6_K/Q8_0 input tensors as dequantizable to float
+// --dequant-input: treat Q4_K/Q5_K/Q6_K/Q8_0 input tensors as dequantizable to float
 static bool g_dequant_input = false;
 
 static bool is_dequant_type(GGMLType ty) {
-    return ty == GGMLType::Q4_K || ty == GGMLType::Q6_K || ty == GGMLType::Q8_0;
+    return ty == GGMLType::Q4_K || ty == GGMLType::Q5_K || ty == GGMLType::Q6_K || ty == GGMLType::Q8_0;
 }
 
 // Byte offset for a given number of elements, per on-disk type.
@@ -46,6 +46,7 @@ static uint64_t elem_offset_bytes(GGMLType ty, size_t elems) {
     switch (ty) {
         case GGMLType::F16:  return (uint64_t)elems * sizeof(uint16_t);
         case GGMLType::Q4_K: return (uint64_t)(elems / QK_K) * sizeof(block_q4_K);
+        case GGMLType::Q5_K: return (uint64_t)(elems / QK_K) * sizeof(block_q5_K);
         case GGMLType::Q6_K: return (uint64_t)(elems / QK_K) * sizeof(block_q6_K);
         case GGMLType::Q8_0: return (uint64_t)(elems / QK8_0) * sizeof(block_q8_0);
         default:             return (uint64_t)elems * sizeof(float);
@@ -146,6 +147,15 @@ static bool read_tensor_floats(const GGUFParser& parser, const GGUFTensor& t, st
         std::vector<uint8_t> raw((n / QK_K) * sizeof(block_q4_K));
         if (!parser.read_tensor(t, raw.data(), raw.size())) return false;
         dequantize_row_q4_K((const block_q4_K*)raw.data(), out.data(), (int64_t)n);
+        return true;
+    } else if (g_dequant_input && t.type == GGMLType::Q5_K) {
+        if (n % QK_K != 0) {
+            std::cerr << "read_tensor_floats: " << t.name << " Q5_K not block-aligned (n=" << n << ")" << std::endl;
+            return false;
+        }
+        std::vector<uint8_t> raw((n / QK_K) * sizeof(block_q5_K));
+        if (!parser.read_tensor(t, raw.data(), raw.size())) return false;
+        dequantize_row_q5_K((const block_q5_K*)raw.data(), out.data(), (int64_t)n);
         return true;
     } else if (g_dequant_input && t.type == GGMLType::Q6_K) {
         if (n % QK_K != 0) {
@@ -372,11 +382,11 @@ int main(int argc, char** argv) {
         for (const auto& t : parser.tensors()) {
             if (t.type == GGMLType::F32 || t.type == GGMLType::F16 || is_dequant_type(t.type)) continue;
             std::cerr << "Error: --dequant-input cannot dequantize tensor '" << t.name
-                      << "' (type " << (uint32_t)t.type << "). Supported input types: F32, F16, Q4_K, Q6_K, Q8_0."
+                      << "' (type " << (uint32_t)t.type << "). Supported input types: F32, F16, Q4_K, Q5_K, Q6_K, Q8_0."
                       << std::endl;
             return 1;
         }
-        std::cout << "--dequant-input: dequantizing Q4_K/Q6_K/Q8_0 tensors to float before profiling" << std::endl;
+        std::cout << "--dequant-input: dequantizing Q4_K/Q5_K/Q6_K/Q8_0 tensors to float before profiling" << std::endl;
     }
 
     bool any_float = false;

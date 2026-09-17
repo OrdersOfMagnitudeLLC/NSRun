@@ -31,6 +31,15 @@ typedef struct {
     int8_t  qs[QK8_0]; // quants
 } block_q8_0;
 
+// 5-bit quantization, 8 blocks of 32 elements (x = a*q + b), ~5.5 bits/weight
+typedef struct {
+    ggml_half d;                    // super-block scale for quantized scales
+    ggml_half dmin;                 // super-block scale for quantized mins
+    uint8_t scales[K_SCALE_SIZE];   // scales and mins, quantized with 6 bits
+    uint8_t qh[QK_K/8];             // quants, high bit
+    uint8_t qs[QK_K/2];             // quants, low 4 bits
+} block_q5_K;
+
 // block_q8_K -- copied exactly from llama.cpp ggml-common.h:372-375.
 // Shared here (rather than duplicated per-TU) so AVX-512 and AVX2-only
 // translation units (e.g. ns_llama_gemv.cpp) can pass pointers to it with
@@ -115,6 +124,29 @@ static inline void dequantize_row_q6_K(const block_q6_K * x, float * y, int64_t 
             ql += 64;
             qh += 32;
             sc += 8;
+        }
+    }
+}
+
+static inline void dequantize_row_q5_K(const block_q5_K * x, float * y, int64_t k) {
+    const int64_t nb = k / QK_K;
+    for (int i = 0; i < nb; i++) {
+        const uint8_t * ql = x[i].qs;
+        const uint8_t * qh = x[i].qh;
+        const float d   = GGML_FP16_TO_FP32(x[i].d);
+        const float min = GGML_FP16_TO_FP32(x[i].dmin);
+        int is = 0;
+        uint8_t sc, m;
+        uint8_t u1 = 1, u2 = 2;
+        for (int j = 0; j < QK_K; j += 64) {
+            get_scale_min_k4(is + 0, x[i].scales, &sc, &m);
+            const float d1 = d * sc; const float m1 = min * m;
+            get_scale_min_k4(is + 1, x[i].scales, &sc, &m);
+            const float d2 = d * sc; const float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l]  >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+            ql += 32; is += 2;
+            u1 <<= 2; u2 <<= 2;
         }
     }
 }
