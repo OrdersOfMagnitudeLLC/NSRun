@@ -29,9 +29,11 @@
 #include <cassert>
 
 static const size_t CLUSTER_SIZE = 256;
-// activation_freq stores each cluster's absolute mean-|y| score. Clusters are
-// ranked globally across all tensors; the top hot_budget elements -> Q8_0,
-// bottom cold_budget -> Q2_K, rest -> Q4_K (see --hot-budget/--cold-budget).
+// activation_freq stores each cluster's Wanda importance score:
+//   importance_ij = |W_ij| * act_norm[j],  act_norm[j] = sum_samples ||x_j||
+// Clusters are ranked globally across all tensors; the top hot_budget
+// elements -> Q8_0, bottom cold_budget -> Q2_K, rest -> Q4_K
+// (see --hot-budget/--cold-budget).
 
 // --dequant-input: treat Q4_K/Q5_K/Q6_K/Q8_0 input tensors as dequantizable to float
 static bool g_dequant_input = false;
@@ -234,11 +236,12 @@ static size_t quantize_to_type(const std::vector<float>& w, GGMLType ty, std::ve
     }
 }
 
-// Profiles each row by mean |y| across prompts (y_r = dot(w_row, x)), then
-// stores each cluster's mean |y| PERCENTILE RANK (0..1 within this tensor) into
-// cluster_score. The rank is normalized per-tensor so a global sort distributes
-// the hot/warm/cold budget within every tensor — a raw |y| score would instead
-// be dominated by tensor scale and push whole low-magnitude tensors to Q2_K.
+// Wanda-style single-pass importance scoring. For each input channel j,
+// act_norm[j] = sum over calibration samples of ||x_j||_2 (scalar -> |x_j|).
+// Element importance: importance[i,j] = |W[i,j]| * act_norm[j].
+// Each cluster's score = mean element importance over its flat element range.
+// No per-tensor normalization: weight magnitude x activation norm is already
+// cross-tensor comparable, so the global budget sort is correct.
 static void profile_tensor(const float* w, int n_rows, int n_cols,
                            const std::vector<std::vector<float>>& xs,
                            std::vector<float>& cluster_score) {
@@ -247,57 +250,25 @@ static void profile_tensor(const float* w, int n_rows, int n_cols,
     cluster_score.assign(n_clusters, 0.5f);
     if (n_rows <= 0 || n_cols <= 0 || xs.empty()) return;
 
-    // Accumulate |y_r| per row across all prompts (parallel over prompts).
-    std::vector<float> row_sum(n_rows, 0.0f);
-    #pragma omp parallel
-    {
-        std::vector<float> local(n_rows, 0.0f);
-        #pragma omp for nowait
-        for (size_t pi = 0; pi < xs.size(); ++pi) {
-            const std::vector<float>& x = xs[pi];
-            for (int r = 0; r < n_rows; ++r) {
-                float s = 0.0f;
-                const float* wr = w + (size_t)r * n_cols;
-                for (int c = 0; c < n_cols; ++c) s += wr[c] * x[c];
-                local[r] += std::fabs(s);
-            }
-        }
-        #pragma omp critical
-        {
-            for (int r = 0; r < n_rows; ++r) row_sum[r] += local[r];
-        }
+    // act_norm[j] = sum over samples of ||x_j||_2 (per-sample L2 norm of the
+    // scalar channel activation = |x_j|)
+    std::vector<float> act_norm(n_cols, 0.0f);
+    for (const auto& x : xs) {
+        for (int j = 0; j < n_cols; ++j) act_norm[j] += std::fabs(x[j]);
     }
 
-    // mean_activation[r] = mean |y_r| across prompts
-    std::vector<float> mean_act(n_rows);
-    float inv = 1.0f / (float)xs.size();
-    for (int r = 0; r < n_rows; ++r) mean_act[r] = row_sum[r] * inv;
-
-    // Percentile rank of each row's mean_activation (0 = smallest, 1 = largest)
-    std::vector<int> order(n_rows);
-    std::iota(order.begin(), order.end(), 0);
-    std::sort(order.begin(), order.end(),
-              [&](int a, int b) { return mean_act[a] < mean_act[b]; });
-    std::vector<float> row_rank(n_rows);
-    float denom = (n_rows > 1) ? (float)(n_rows - 1) : 1.0f;
-    for (int i = 0; i < n_rows; ++i) row_rank[order[i]] = (float)i / denom;
-
-    // Each cluster's score = element-weighted mean rank of the rows it overlaps.
+    // Cluster score = mean of |W_ij| * act_norm[j] over the cluster's elements
+    // (parallel over clusters; single pass over the weight buffer).
+    #pragma omp parallel for schedule(static)
     for (size_t ci = 0; ci < n_clusters; ++ci) {
         size_t f0 = ci * CLUSTER_SIZE;
-        size_t f1 = std::min(f0 + CLUSTER_SIZE - 1, total - 1);
-        int r0 = (int)(f0 / (size_t)n_cols);
-        int r1 = (int)(f1 / (size_t)n_cols);
+        size_t f1 = std::min(f0 + CLUSTER_SIZE, total);
         double acc = 0.0;
-        size_t cnt = 0;
-        for (int r = r0; r <= r1; ++r) {
-            size_t e0 = std::max(f0, (size_t)r * (size_t)n_cols);
-            size_t e1 = std::min(f1, (size_t)r * (size_t)n_cols + (size_t)n_cols - 1);
-            size_t nn = (e1 >= e0) ? (e1 - e0 + 1) : 0;
-            acc += (double)row_rank[r] * (double)nn;
-            cnt += nn;
+        for (size_t e = f0; e < f1; ++e) {
+            int j = (int)(e % (size_t)n_cols);
+            acc += (double)std::fabs(w[e]) * (double)act_norm[j];
         }
-        cluster_score[ci] = cnt ? (float)(acc / (double)cnt) : 0.5f;
+        cluster_score[ci] = (float)(acc / (double)(f1 - f0));
     }
 }
 
@@ -452,7 +423,7 @@ int main(int argc, char** argv) {
     std::vector<TensorOut> outs(n_tensors);
     std::vector<TensorJob> jobs(n_tensors);
 
-    // PASS 1: per-tensor metadata + mean-|y| profiling per cluster. The score is
+    // PASS 1: per-tensor metadata + Wanda importance profiling per cluster. The score is
     // stored in activation_freq; quantization is deferred until after the
     // global budget sort decides every cluster's bit width.
     for (size_t ti = 0; ti < n_tensors; ++ti) {
@@ -548,7 +519,7 @@ int main(int argc, char** argv) {
                       << " by " << J.row_chunk << " (cols " << J.n_cols << ")" << std::endl;
         }
 
-        // Profile each chunk: per-cluster mean-|y| score
+        // Profile each chunk: per-cluster Wanda importance score
         for (int row_start = 0; row_start < J.n_rows; row_start += (int)J.row_chunk) {
             int row_end = std::min(row_start + (int)J.row_chunk, J.n_rows);
             int chunk_n_rows = row_end - row_start;
@@ -581,7 +552,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // GLOBAL BUDGET: sort all profiled, non-forced clusters by mean-|y| score.
+    // GLOBAL BUDGET: sort all profiled, non-forced clusters by Wanda importance.
     // Top hot_budget elements -> Q8_0, bottom cold_budget -> Q2_K, rest -> Q4_K.
     size_t total_params = 0;
     for (size_t ti = 0; ti < n_tensors; ++ti) {
