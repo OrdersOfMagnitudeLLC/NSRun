@@ -23120,8 +23120,10 @@ static void ggml_compute_forward_ns_infer(
     const int64_t ith = params->ith;
     const int64_t nth = params->nth;
 
-    // Work buffer: per-thread flat_indices [d_ff ints]
-    int * flat_indices = (int *)((char *)params->wdata + ith * d_ff * sizeof(int));
+    // Work buffer: per-thread flat_indices [d_ff ints] + keep_mask [d_ff bytes].
+    // Stride must be d_ff*(sizeof(int)+1) to match the wdata allocation,
+    // otherwise each thread's keep_mask overlaps the next thread's flat_indices.
+    int * flat_indices = (int *)((char *)params->wdata + ith * d_ff * (sizeof(int) + 1));
 
     // Distribute tokens across threads
     int64_t t_start = (n_tokens * ith) / nth;
