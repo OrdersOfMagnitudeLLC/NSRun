@@ -23106,100 +23106,109 @@ static void ggml_compute_forward_ns_attention(
 
 #ifdef NS_INFER_ENABLED
 // ggml_compute_forward_ns_infer
+//
+// Rewritten to operate on the full [d_ff, n_tokens] batch at once instead of
+// looping per-token with a histogram sort. Neuron importance (mean |activation|)
+// is now computed once across the whole batch, a single global top-k selection
+// picks the neurons to keep, and the same set of neurons is kept for every token
+// in the batch. This removes the branchy per-token histogram-sort scan and lets
+// the (unchanged) downstream ggml_mul_mat consume the result exactly as before,
+// preserving its existing AVX/AVX512 quantized GEMM path.
+
+// Partitions idx[lo..hi] (keyed by mean_abs[idx[i]]) in descending order so that,
+// on return, idx[lo..target] holds the (target-lo+1) largest values (unordered
+// within that range). This is a standard quickselect (nth_element), O(d_ff) average.
+static void ggml_ns_infer_select_topk(
+        int * idx, const float * mean_abs, int64_t lo, int64_t hi, int64_t target) {
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (mean_abs[idx[mid]] > mean_abs[idx[lo]]) { int t = idx[lo]; idx[lo] = idx[mid]; idx[mid] = t; }
+        if (mean_abs[idx[hi]]  > mean_abs[idx[lo]]) { int t = idx[lo]; idx[lo] = idx[hi];  idx[hi]  = t; }
+        if (mean_abs[idx[mid]] > mean_abs[idx[hi]]) { int t = idx[mid]; idx[mid] = idx[hi]; idx[hi] = t; }
+        const float pivot = mean_abs[idx[hi]];
+
+        int64_t i = lo;
+        for (int64_t j = lo; j < hi; j++) {
+            if (mean_abs[idx[j]] > pivot) {
+                int t = idx[i]; idx[i] = idx[j]; idx[j] = t;
+                i++;
+            }
+        }
+        { int t = idx[i]; idx[i] = idx[hi]; idx[hi] = t; }
+
+        if (target == i) {
+            return;
+        } else if (target < i) {
+            hi = i - 1;
+        } else {
+            lo = i + 1;
+        }
+    }
+}
 
 static void ggml_compute_forward_ns_infer(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
     const struct ggml_tensor * src = dst->src[0];
 
-    float energy_threshold;
-    memcpy(&energy_threshold, dst->op_params, sizeof(float));
+    float keep_fraction;
+    memcpy(&keep_fraction, dst->op_params, sizeof(float));
 
     const int64_t d_ff     = src->ne[0];
     const int64_t n_tokens = src->ne[1];
 
-    const int64_t ith = params->ith;
-    const int64_t nth = params->nth;
+    const int ith = params->ith;
+    const int nth = params->nth;
 
-    // Work buffer: per-thread flat_indices [d_ff ints] + keep_mask [d_ff bytes].
-    // Stride must be d_ff*(sizeof(int)+1) to match the wdata allocation,
-    // otherwise each thread's keep_mask overlaps the next thread's flat_indices.
-    int * flat_indices = (int *)((char *)params->wdata + ith * d_ff * (sizeof(int) + 1));
+    // Shared work buffer (not per-thread): mean_abs[d_ff] floats, idx[d_ff] ints,
+    // keep_mask[d_ff] bytes. Layout must match the size computed in ggml_get_work_size().
+    float * mean_abs  = (float *)params->wdata;
+    int   * idx        = (int   *)(mean_abs + d_ff);
+    char  * keep_mask  = (char  *)(idx + d_ff);
 
-    // Distribute tokens across threads
-    int64_t t_start = (n_tokens * ith) / nth;
-    int64_t t_end   = (n_tokens * (ith + 1)) / nth;
+    // Phase 1: mean(|activation|) per neuron across the *entire* token batch,
+    // parallelized across the d_ff dimension. Replaces the old per-token energy loop.
+    const int64_t j_start = (d_ff * ith) / nth;
+    const int64_t j_end   = (d_ff * (ith + 1)) / nth;
+
+    for (int64_t j = j_start; j < j_end; j++) {
+        float sum = 0.0f;
+        for (int64_t t = 0; t < n_tokens; t++) {
+            const float * s = (const float *)((const char *)src->data + t * src->nb[1]);
+            sum += fabsf(s[j]);
+        }
+        mean_abs[j] = sum / (float)n_tokens;
+        idx[j] = (int)j;
+    }
+
+    ggml_barrier(params->shared);
+
+    // Phase 2: single global top-k selection (thread 0 only) over the mean activations.
+    int64_t k = (int64_t)((float)d_ff * keep_fraction);
+    if (k < 1)     k = 1;
+    if (k > d_ff)  k = d_ff;
+
+    if (ith == 0) {
+        ggml_ns_infer_select_topk(idx, mean_abs, 0, d_ff - 1, k - 1);
+
+        memset(keep_mask, 0, d_ff);
+        for (int64_t i = 0; i < k; i++) {
+            keep_mask[idx[i]] = 1;
+        }
+    }
+
+    ggml_barrier(params->shared);
+
+    // Phase 3: apply the single shared keep mask to every token in the batch,
+    // using ggml's normal batched tensor (no per-token branching/sorting).
+    const int64_t t_start = (n_tokens * ith) / nth;
+    const int64_t t_end   = (n_tokens * (ith + 1)) / nth;
 
     for (int64_t t = t_start; t < t_end; t++) {
         const float * s = (const float *)((const char *)src->data + t * src->nb[1]);
-        float * act = (float *)((char *)dst->data + t * dst->nb[1]);
-
-        // Copy src to dst
+        float * o = (float *)((char *)dst->data + t * dst->nb[1]);
         for (int64_t j = 0; j < d_ff; j++) {
-            act[j] = s[j];
-        }
-
-        float total_energy = 0.0f;
-        float max_energy = 0.0f;
-        for (int64_t j = 0; j < d_ff; j++) {
-            float e = act[j] * act[j];
-            total_energy += e;
-            if (e > max_energy) max_energy = e;
-        }
-
-        if (max_energy <= 0.0f) continue;
-
-        // Skip if activation variance is low: if max energy < 2x average,
-        // the activations are nearly uniform and zeroing would hurt quality
-        float avg_energy = total_energy / (float)d_ff;
-        if (max_energy < 2.0f * avg_energy) continue;
-
-        // NS histogram sort: 256 buckets, O(n) partial sort
-        int bucket_counts[256] = {0};
-        int bucket_starts[256] = {0};
-
-        for (int64_t j = 0; j < d_ff; j++) {
-            float e = act[j] * act[j];
-            uint8_t b = (uint8_t)(e / max_energy * 255.0f);
-            bucket_counts[b]++;
-        }
-
-        bucket_starts[255] = 0;
-        for (int b = 254; b >= 0; --b) {
-            bucket_starts[b] = bucket_starts[b + 1] + bucket_counts[b + 1];
-        }
-
-        int temp_pos[256];
-        memcpy(temp_pos, bucket_starts, sizeof(bucket_starts));
-        for (int64_t j = 0; j < d_ff; j++) {
-            float e = act[j] * act[j];
-            uint8_t b = (uint8_t)(e / max_energy * 255.0f);
-            flat_indices[temp_pos[b]++] = (int)j;
-        }
-
-        // Scan high->low, accumulate energy until threshold
-        float target_energy = energy_threshold * total_energy;
-        float cumulative_energy = 0.0f;
-        int64_t keep_count = 0;
-
-        for (int64_t i = 0; i < d_ff; i++) {
-            int j = flat_indices[i];
-            cumulative_energy += act[j] * act[j];
-            keep_count++;
-            if (cumulative_energy >= target_energy) break;
-        }
-
-        // Zero out neurons not in the keep set
-        // Mark kept indices, then zero everything else
-        char * keep_mask = (char *)(flat_indices + d_ff);
-        memset(keep_mask, 0, d_ff);
-        for (int64_t i = 0; i < keep_count; i++) {
-            keep_mask[flat_indices[i]] = 1;
-        }
-        for (int64_t j = 0; j < d_ff; j++) {
-            if (!keep_mask[j]) {
-                act[j] = 0.0f;
-            }
+            o[j] = keep_mask[j] ? s[j] : 0.0f;
         }
     }
 }
@@ -23209,14 +23218,14 @@ static void ggml_compute_forward_ns_infer(
 GGML_API struct ggml_tensor * ggml_ns_infer(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
-        float                 energy_threshold) {
+        float                 keep_fraction) {
     GGML_ASSERT(x->type == GGML_TYPE_F32);
 
     // x: [d_ff, n_tokens]
     // result: same shape
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
 
-    float params[] = { energy_threshold };
+    float params[] = { keep_fraction };
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op   = GGML_OP_NS_INFER;
@@ -29365,9 +29374,9 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
             #ifdef NS_INFER_ENABLED
             case GGML_OP_NS_INFER:
                 {
-                    // per-thread: flat_indices (d_ff ints) + keep_mask (d_ff bytes)
+                    // shared (not per-thread): mean_abs (d_ff floats) + idx (d_ff ints) + keep_mask (d_ff bytes)
                     int64_t d_ff = node->src[0]->ne[0];
-                    cur = d_ff * (sizeof(int) + 1) * n_tasks;
+                    cur = d_ff * (sizeof(float) + sizeof(int) + 1);
                 } break;
             #endif // NS_INFER_ENABLED
             case GGML_OP_CROSS_ENTROPY_LOSS:

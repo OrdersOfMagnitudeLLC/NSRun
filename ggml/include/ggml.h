@@ -2527,14 +2527,17 @@ extern "C" {
             struct ggml_tensor  * mask,
             float                 scale);
 
-    // NSInfer: dynamic MLP sparsity via energy threshold.
+    // NSInfer: dynamic MLP sparsity via global mean-activation top-k.
     // x: [d_ff, n_tokens] — intermediate activations after gate*up (SwiGLU hidden)
-    // Returns same shape — activations with low-energy neurons zeroed
+    // keep_fraction: fraction of neurons (by mean |activation| across the whole
+    // batch) to keep; k = d_ff * keep_fraction. Same k neurons are kept for
+    // every token in the batch.
+    // Returns same shape — activations with non-selected neurons zeroed
     #ifdef NS_INFER_ENABLED
     GGML_API struct ggml_tensor * ggml_ns_infer(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,
-            float                 energy_threshold);
+            float                 keep_fraction);
     #endif // NS_INFER_ENABLED
 
     // Latent attention over a packed K/V cache with an independently-visible K/V prefix.
