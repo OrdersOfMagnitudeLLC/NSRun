@@ -1,7 +1,7 @@
-// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
+// NSKVCache: OOM LLC Commercial License - see LICENSE-OOM
 // Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
 //
-// NSKVStore — INT8-quantized paged KV store implementation.
+// NSKVStore: INT8-quantized paged KV store implementation.
 // Part of the NSRun inference stack.
 
 #include "ns_kv_store.h"

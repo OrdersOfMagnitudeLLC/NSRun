@@ -1,6 +1,6 @@
-NSRun — NSKVCache Benchmark Results
+NSRun: NSKVCache Benchmark Results
 =====================================
-OOM LLC Commercial License — see LICENSE-OOM
+OOM LLC Commercial License: see LICENSE-OOM
 Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
 
 Model: Qwen2.5-3B-Instruct (Q4_K_M)

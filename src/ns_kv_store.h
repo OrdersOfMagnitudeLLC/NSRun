@@ -1,7 +1,7 @@
-// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
+// NSKVCache: OOM LLC Commercial License - see LICENSE-OOM
 // Copyright (c) 2026 Orders of Magnitude LLC. All rights reserved.
 //
-// NSKVStore — INT8-quantized paged KV store with information-content eviction.
+// NSKVStore: INT8-quantized paged KV store with information-content eviction.
 // Part of the NSRun inference stack.
 
 #pragma once
@@ -84,11 +84,11 @@ public:
     // Dequantizes only the kv_head slice needed: 
     //   out buffers must be size head_dim.
     // kv_head: which KV head to dequant (0..n_kv_heads-1)
-    // Returns false if slot was evicted — caller skips this position.
+ // Returns false if slot was evicted - caller skips this position.
     bool read_head(size_t layer, size_t seq_pos, size_t kv_head,
                    float* k_out, float* v_out) const;
 
-    // Same as read_head but dequantizes only K or only V — for callers
+ // Same as read_head but dequantizes only K or only V - for callers
     // (e.g. attention_impl's score/accumulate loops) that only need one
     // side per pass, halving KV dequant work vs. calling read_head twice.
     bool read_k_head(size_t layer, size_t seq_pos, size_t kv_head,

@@ -20,8 +20,8 @@ Everything else is upstream ik_llama / llama.cpp.
 
 ## License
 
-Base engine (llama.cpp/ik_llama): MIT — see [LICENSE-MIT](LICENSE-MIT)  
-NS Additions (NSKVCache, NSAttend, NSInfer, NSQuant): OOM Commercial License — see [LICENSE-OOM](LICENSE-OOM)
+Base engine (llama.cpp/ik_llama): MIT: see [LICENSE-MIT](LICENSE-MIT) 
+NS Additions (NSKVCache, NSAttend, NSInfer, NSQuant): OOM Commercial License: see [LICENSE-OOM](LICENSE-OOM)
 
 ## TL;DR
 
@@ -285,7 +285,7 @@ Architecture decisions, debugging, and implementation were collaborative.
 We believe in transparent disclosure of AI tool usage.
 
 **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md). 
-A CLA is required before any PR merges — see [type1-toolkit](https://github.com/OrdersOfMagnitudeLLC/type1-toolkit) for the CLA process.
+A CLA is required before any PR merges - see [type1-toolkit](https://github.com/OrdersOfMagnitudeLLC/type1-toolkit) for the CLA process.
 
 ## License
 

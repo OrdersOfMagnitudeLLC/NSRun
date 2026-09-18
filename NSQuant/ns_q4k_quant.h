@@ -31,7 +31,7 @@ inline uint16_t f32_to_fp16(float x) {
     if (ne >= 31) return s | 0x7C00; // overflow -> inf
     if (ne <= 0) {
         // FP16 subnormal: value = mant10 * 2^-24. Preserve small values as
-        // denormals instead of flushing to zero — flushing produced d=0
+ // denormals instead of flushing to zero - flushing produced d=0
         // super-block scales that flattened Q4_K blocks (the gibberish bug).
         if (ne < -10) return s; // too small -> 0
         m |= 0x800000; // restore implicit leading 1

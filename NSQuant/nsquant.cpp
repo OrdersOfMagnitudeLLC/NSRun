@@ -482,7 +482,7 @@ int main(int argc, char** argv) {
         to.clusters.resize(J.nc);
 
         // Precision floor: token_embd and the LM head (output.weight) are
-        // forced to Q8 — too sensitive for lower bits. Attention and blk.0
+ // forced to Q8: too sensitive for lower bits. Attention and blk.0
         // tensors are budgeted normally (no forced override).
         if (t.name.find("token_embd") != std::string::npos ||
             t.name == "output.weight") {
@@ -599,7 +599,7 @@ int main(int argc, char** argv) {
         TensorOut& to = outs[ti];
         if (!J.float_path) continue;  // passthrough type set in pass 2
         if (!J.quantizable) {
-            // Keep F32 source tensors (biases, norms) as F32 — llama.cpp's
+ // Keep F32 source tensors (biases, norms) as F32 - llama.cpp's
             // element-wise add path requires matching operand types/shapes.
             to.quant_type = (t.type == GGMLType::F32 || J.f32_tensor) ? (uint32_t)GGMLType::F32 : (uint32_t)GGMLType::F16;
             continue;

@@ -3,7 +3,7 @@
 // See LICENSE.md in the repository root or ofmagnitude.com
 //
 // GGUF-standard quantizers for NSQuant output: Q8_0 and Q2_K.
-// Ported from ggml-quants.c (llama.cpp / ik_llama) — produces bit-exact
+// Ported from ggml-quants.c (llama.cpp / ik_llama) - produces bit-exact
 // ggml blocks loadable by llama-cli. Q4_K lives in ns_q4k_quant.h.
 
 #ifndef NS_GGUF_QUANT_H

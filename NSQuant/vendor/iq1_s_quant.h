@@ -2,7 +2,7 @@
 // Licensed under the OOM Commercial License v1.0
 // See LICENSE.md in the repository root or ofmagnitude.com
 //
-// IQ1_S quantizer for the NSQuant cold tier — ported from ik_llama
+// IQ1_S quantizer for the NSQuant cold tier - ported from ik_llama
 // ggml-quants.c (quantize_row_iq1_s_impl + iq1s_process_1block +
 // iq1_find_best_neighbour2 + iq2xs_init_impl for the IQ1_S grid).
 // 1.5625 bpw: 256 values/block -> 50 bytes (fp16 scale + 32B qs + 16B qh).
