@@ -31,3 +31,7 @@ Requires a GGUF input file to run. No benchmark data available without a model f
 
 - **zlib**: zlib License (system-installed)
 - Headers from deprecated NSRun: `ns_q4k_quant.h`, `ns_repack.h`, `ns_dequant.h`
+
+## Build dependencies
+
+`nsm.h`, `nsm_loader.cpp`, `gguf_parser.cpp`, `tokenizer.cpp` are required to build. The NSM output format is deprecated; these files now serve GGUF parsing and tokenization only. Do not remove them.
