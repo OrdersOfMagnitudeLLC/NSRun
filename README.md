@@ -2,6 +2,22 @@
 
 [![License: Dual MIT/OOM](https://img.shields.io/badge/license-MIT%20%2B%20OOM%20Commercial-orange.svg)](LICENSE)
 
+## OOM Additions
+
+This is an ik_llama fork. OOM added four components:
+
+| Component | Location | What it does |
+|---|---|---|
+| NSKVCache | `include/kv-box.h` · `src/ns_kv_store.*` | 208.7× KV compression at 1M context |
+| NSAttend  | `ggml/src/ggml.c` (NS_ATTEND sections) | 28.7× sparse attention |
+| NSInfer   | `ggml/src/ggml.c` (NS_INFER sections) | Sparse MLP activation, +70% prompt eval at 72B |
+| NSQuant   | `NSQuant/` | Activation-aware quantization, 7.2× on 72B |
+
+OOM additions are marked with NS_ prefixes throughout.
+Everything else is upstream ik_llama / llama.cpp.
+
+→ [Full toolkit](https://github.com/OrdersOfMagnitudeLLC/type1-toolkit)
+
 NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp)) with four novel NS components:
 
 | Component | Function | Result |
