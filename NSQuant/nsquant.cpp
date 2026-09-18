@@ -325,8 +325,8 @@ static std::vector<std::vector<float>> build_prompt_inputs(const BPETokenizer& t
 }
 
 int main(int argc, char** argv) {
-    long long cli_hot_budget = 200000000;
-    long long cli_warm_budget = 1000000000;
+    long long cli_hot_budget = -1;
+    long long cli_warm_budget = -1;
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -560,8 +560,8 @@ int main(int argc, char** argv) {
     for (size_t ti = 0; ti < n_tensors; ++ti) {
         if (jobs[ti].quantizable) total_params += numel(parser.tensors()[ti]);
     }
-    size_t hot_budget  = std::min((size_t)(total_params * 0.05), (size_t)cli_hot_budget);
-    size_t warm_budget = std::min((size_t)(total_params * 0.25), (size_t)cli_warm_budget);
+    size_t hot_budget  = cli_hot_budget  >= 0 ? (size_t)cli_hot_budget  : (size_t)(total_params * 0.05);
+    size_t warm_budget = cli_warm_budget >= 0 ? (size_t)cli_warm_budget : (size_t)(total_params * 0.25);
 
     struct ScoreEnt { float score; size_t ti, ci, elems; };
     std::vector<ScoreEnt> ent;
