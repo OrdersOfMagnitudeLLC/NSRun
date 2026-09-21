@@ -1,13 +1,13 @@
-NSRun — Dual License
+NSRun - Dual License
 
 Base engine (llama.cpp / ik_llama):
-MIT License — see LICENSE-MIT
+MIT License - see LICENSE-MIT
 
 NS Additions (NSKVCache, NSAttend, NSInfer, NSQuant):
-OOM Commercial License — see LICENSE-OOM
+OOM Commercial License - see LICENSE-OOM
 
 NS-authored files: kv-box.h, ns_kv_store.h, ns_kv_store.cpp,
 and all sections in llama.cpp marked
-"NSKVCache — OOM LLC Commercial License"
+"NSKVCache - OOM LLC Commercial License"
 
 Copyright 2026 Orders of Magnitude LLC
