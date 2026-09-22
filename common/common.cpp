@@ -1946,12 +1946,20 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.flash_attn = false;
         return true;
     }
+    if (arg == "--no-ns-attend") {
+        params.ns_attend = false;
+        return true;
+    }
     if (arg == "-nsi" || arg == "--ns-infer") {
     #ifdef NS_INFER_ENABLED
         params.ns_infer = true;
     #else
         fprintf(stderr, "warning: --ns-infer ignored (NSInfer not compiled in; rebuild with -DNS_INFER_ENABLED)\n");
     #endif // NS_INFER_ENABLED
+        return true;
+    }
+    if (arg == "--no-ns-infer") {
+        params.ns_infer = false;
         return true;
     }
     if (arg == "--ns-infer-threshold") {
@@ -3114,6 +3122,8 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-nsa,  --ns-attend",            "enable NSAttend sparse attention (default: %s)", params.ns_attend ? "enabled" : "disabled" });
     options.push_back({ "*",           "-nsi,  --ns-infer",             "enable NSInfer MLP sparsity (default: %s)", params.ns_infer ? "enabled" : "disabled" });
     options.push_back({ "*",           "       --ns-infer-threshold F",  "NSInfer energy retention threshold (default: %.2f)", (double)params.ns_infer_threshold });
+    options.push_back({ "*",           "       --no-ns-attend",         "disable NSAttend sparse attention (overrides --ns-attend / LLAMA_ARG_NS_ATTEND)" });
+    options.push_back({ "*",           "       --no-ns-infer",          "disable NSInfer MLP sparsity (overrides --ns-infer / LLAMA_ARG_NS_INFER)" });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
     options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });

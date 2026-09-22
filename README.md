@@ -2,6 +2,22 @@
 
 [![License: Dual MIT/OOM](https://img.shields.io/badge/license-MIT%20%2B%20OOM%20Commercial-orange.svg)](LICENSE)
 
+## Running NSRun (CPU)
+
+GPU users must pass `-ngl 0` to force CPU-only inference.
+NSKVCache and other NS ops do not have CUDA kernels yet.
+Without this flag the model will hang on GPU hardware.
+
+Verified command:
+```bash
+./llama-cli -m your-model-q4_k_m.gguf \
+  -c 1048576 -b 1024 --kv-box -ngl 0 \
+  -p "your prompt"
+```
+
+Minimum -b 1024 required for coherent generation.
+CUDA and ROCm support in progress.
+
 ## OOM Additions
 
 NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp)) with four novel NS components:
