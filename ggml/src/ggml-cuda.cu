@@ -56,6 +56,7 @@
 #include "ggml-cuda/multiadd.cuh"
 #include "ggml-cuda/hadamard.cuh"
 #include "ggml-cuda/reduce.cuh"
+#include "ggml-cuda/ns-infer.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/delta-net.cuh"
 #include "ggml-cuda/kda.cuh"
@@ -4225,6 +4226,11 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DS4_COMP:
             ggml_cuda_op_ds4_comp(ctx, dst);
             break;
+#ifdef NS_INFER_ENABLED
+        case GGML_OP_NS_INFER:
+            ggml_cuda_op_ns_infer(ctx, dst);
+            break;
+#endif
         default:
             return false;
     }
@@ -5077,6 +5083,11 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         //    return ggml_is_contiguous(op->src[0]);
         case GGML_OP_ARGSORT:
             return true;
+#ifdef NS_INFER_ENABLED
+        case GGML_OP_NS_INFER:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   op->src[0]->nb[0] == sizeof(float);
+#endif
         case GGML_OP_ARGSORT_THRESH:
             // The CUDA bitonic argsort launches one thread per (padded) column, so the
             // row width rounded up to a power of 2 must fit in a single CUDA block (<=1024

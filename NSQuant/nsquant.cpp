@@ -32,8 +32,8 @@ static const size_t CLUSTER_SIZE = 256;
 // activation_freq stores each cluster's Wanda importance score:
 //   importance_ij = |W_ij| * act_norm[j],  act_norm[j] = sum_samples ||x_j||
 // Clusters are ranked globally across all tensors; the top hot_budget
-// elements -> Q8_0, next warm_budget -> Q4_K, everything else -> IQ2_XXS
-// (see --hot-budget/--warm-budget).
+// elements -> Q8_0, next warm_budget -> Q4_K, everything else -> cold tier
+// (see --hot-budget/--warm-budget/--cold-tier).
 
 // --dequant-input: treat Q4_K/Q5_K/Q6_K/Q8_0 input tensors as dequantizable to float
 static bool g_dequant_input = false;
@@ -42,11 +42,30 @@ static bool is_dequant_type(GGMLType ty) {
     return ty == GGMLType::Q4_K || ty == GGMLType::Q5_K || ty == GGMLType::Q6_K || ty == GGMLType::Q8_0;
 }
 
+// --cold-tier: output type for cold (lowest-importance) clusters. Default IQ2_XXS.
+// IQ2_XXS on >50% of a 30B+ model is below the coherence floor; use Q4_K there.
+static GGMLType g_cold_tier = GGMLType::IQ2_XXS;
+static std::string g_cold_name = "IQ2_XXS";
+
+static bool parse_cold_tier(const std::string& s) {
+    std::string u;
+    for (char c : s) u += (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    if      (u == "IQ2_XXS") g_cold_tier = GGMLType::IQ2_XXS;
+    else if (u == "IQ1_S")   g_cold_tier = GGMLType::IQ1_S;
+    else if (u == "Q2_K")    g_cold_tier = GGMLType::Q2_K;
+    else if (u == "Q4_K")    g_cold_tier = GGMLType::Q4_K;
+    else if (u == "Q8_0")    g_cold_tier = GGMLType::Q8_0;
+    else return false;
+    g_cold_name = u;
+    return true;
+}
+
 // Byte offset for a given number of elements, per on-disk type.
 // Quantized types are block-packed: caller must keep element offsets block-aligned.
 static uint64_t elem_offset_bytes(GGMLType ty, size_t elems) {
     switch (ty) {
         case GGMLType::F16:  return (uint64_t)elems * sizeof(uint16_t);
+        case GGMLType::BF16: return (uint64_t)elems * sizeof(uint16_t);
         case GGMLType::Q4_K: return (uint64_t)(elems / QK_K) * sizeof(block_q4_K);
         case GGMLType::Q5_K: return (uint64_t)(elems / QK_K) * sizeof(block_q5_K);
         case GGMLType::Q6_K: return (uint64_t)(elems / QK_K) * sizeof(block_q6_K);
@@ -133,6 +152,12 @@ static float f16_to_f32(uint16_t h) {
     float f; std::memcpy(&f, &v, sizeof(f)); return f;
 }
 
+static float bf16_to_f32(uint16_t v) {
+    uint32_t bits = (uint32_t)v << 16;
+    float f; std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
 static bool read_tensor_floats(const GGUFParser& parser, const GGUFTensor& t, std::vector<float>& out) {
     size_t n = numel(t);
     out.resize(n);
@@ -142,6 +167,11 @@ static bool read_tensor_floats(const GGUFParser& parser, const GGUFTensor& t, st
         std::vector<uint16_t> raw(n);
         if (!parser.read_tensor(t, (uint8_t*)raw.data(), n * sizeof(uint16_t))) return false;
         for (size_t i = 0; i < n; ++i) out[i] = f16_to_f32(raw[i]);
+        return true;
+    } else if (t.type == GGMLType::BF16) {
+        std::vector<uint16_t> raw(n);
+        if (!parser.read_tensor(t, (uint8_t*)raw.data(), n * sizeof(uint16_t))) return false;
+        for (size_t i = 0; i < n; ++i) out[i] = bf16_to_f32(raw[i]);
         return true;
     } else if (g_dequant_input && t.type == GGMLType::Q4_K) {
         if (n % QK_K != 0) {
@@ -333,10 +363,16 @@ int main(int argc, char** argv) {
         if (a == "--dequant-input") g_dequant_input = true;
         else if (a == "--hot-budget" && i + 1 < argc) cli_hot_budget = std::atoll(argv[++i]);
         else if (a == "--warm-budget" && i + 1 < argc) cli_warm_budget = std::atoll(argv[++i]);
+        else if (a == "--cold-tier" && i + 1 < argc) {
+            if (!parse_cold_tier(argv[++i])) {
+                std::cerr << "Unsupported --cold-tier type (valid: IQ2_XXS, IQ1_S, Q2_K, Q4_K, Q8_0)" << std::endl;
+                return 1;
+            }
+        }
         else pos.push_back(a);
     }
     if (pos.size() < 2) {
-        std::cerr << "Usage: " << argv[0] << " [--dequant-input] [--hot-budget N] [--warm-budget N] <input.gguf> <output.gguf> [n_prompts [prompts.txt]]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [--dequant-input] [--hot-budget N] [--warm-budget N] [--cold-tier TYPE] <input.gguf> <output.gguf> [n_prompts [prompts.txt]]" << std::endl;
         return 1;
     }
     const char* in_path = pos[0].c_str();
@@ -363,7 +399,7 @@ int main(int argc, char** argv) {
     // --dequant-input: reject tensor types we cannot dequantize (Q2_K, Q1/IQ*, etc.)
     if (g_dequant_input) {
         for (const auto& t : parser.tensors()) {
-            if (t.type == GGMLType::F32 || t.type == GGMLType::F16 || is_dequant_type(t.type)) continue;
+            if (t.type == GGMLType::F32 || t.type == GGMLType::F16 || t.type == GGMLType::BF16 || is_dequant_type(t.type)) continue;
             std::cerr << "Error: --dequant-input cannot dequantize tensor '" << t.name
                       << "' (type " << (uint32_t)t.type << "). Supported input types: F32, F16, Q4_K, Q5_K, Q6_K, Q8_0."
                       << std::endl;
@@ -374,7 +410,7 @@ int main(int argc, char** argv) {
 
     bool any_float = false;
     for (const auto& t : parser.tensors()) {
-        if (t.type == GGMLType::F32 || t.type == GGMLType::F16 ||
+        if (t.type == GGMLType::F32 || t.type == GGMLType::F16 || t.type == GGMLType::BF16 ||
             (g_dequant_input && is_dequant_type(t.type))) { any_float = true; break; }
     }
     bool structural_q4 = !any_float;
@@ -383,7 +419,7 @@ int main(int argc, char** argv) {
     // before the per-tensor loop so only one tensor is in RAM at a time.
     const GGUFTensor* et = nullptr;
     for (const auto& t : parser.tensors()) {
-        if (t.name == "token_embd.weight" && (t.type == GGMLType::F32 || t.type == GGMLType::F16 ||
+        if (t.name == "token_embd.weight" && (t.type == GGMLType::F32 || t.type == GGMLType::F16 || t.type == GGMLType::BF16 ||
             (g_dequant_input && is_dequant_type(t.type)))) { et = &t; break; }
     }
     std::vector<float> token_embd;
@@ -453,7 +489,7 @@ int main(int argc, char** argv) {
         to.data_offset = 0;
         to.data_bytes = 0;
 
-        J.float_path = (t.type == GGMLType::F32 || t.type == GGMLType::F16) ||
+        J.float_path = (t.type == GGMLType::F32 || t.type == GGMLType::F16 || t.type == GGMLType::BF16) ||
                        (g_dequant_input && is_dequant_type(t.type));
         if (!J.float_path) continue;  // passthrough handled in pass 2
 
@@ -577,7 +613,7 @@ int main(int argc, char** argv) {
         }
     }
     std::sort(ent.begin(), ent.end(), [](const ScoreEnt& a, const ScoreEnt& b) { return a.score > b.score; });
-    for (auto& e : ent) outs[e.ti].clusters[e.ci].quant_bits = 2;  // cold default -> IQ1_S
+    for (auto& e : ent) outs[e.ti].clusters[e.ci].quant_bits = 2;  // cold default -> --cold-tier type
     size_t acc = 0, top = 0;
     for (; top < ent.size() && acc < hot_budget; ++top) {
         acc += ent[top].elems;
@@ -622,9 +658,10 @@ int main(int argc, char** argv) {
         else if (n_cold > n_warm && n_cold > n_hot) bits = 2;
         if (bits < J.min_bits) bits = J.min_bits;
         if (bits > J.max_bits) bits = J.max_bits;
-        GGMLType out_type = (bits == 8) ? GGMLType::Q8_0 : (bits == 2) ? GGMLType::IQ2_XXS : GGMLType::Q4_K;
+        GGMLType out_type = (bits == 8) ? GGMLType::Q8_0 : (bits == 2) ? g_cold_tier : GGMLType::Q4_K;
         if (out_type == GGMLType::Q8_0 && !J.q8_ok) out_type = GGMLType::F16;
-        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::IQ2_XXS) && !J.kquant_ok)
+        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::Q2_K ||
+             out_type == GGMLType::IQ2_XXS || out_type == GGMLType::IQ1_S) && !J.kquant_ok)
             out_type = J.q8_ok ? GGMLType::Q8_0 : GGMLType::F16;
         to.quant_type = (uint32_t)out_type;
     }
@@ -835,7 +872,7 @@ int main(int argc, char** argv) {
         std::cout << "Cluster distribution:" << std::endl;
         std::cout << "  hot  (8-bit): " << total_hot  << " (" << (100.0 * total_hot  / total_clusters) << "%)" << std::endl;
         std::cout << "  warm (4-bit): " << total_warm << " (" << (100.0 * total_warm / total_clusters) << "%)" << std::endl;
-        std::cout << "  cold (IQ2_XXS): " << total_cold << " (" << (100.0 * total_cold / total_clusters) << "%)" << std::endl;
+        std::cout << "  cold (" << g_cold_name << "): " << total_cold << " (" << (100.0 * total_cold / total_clusters) << "%)" << std::endl;
     } else if (structural_q4) {
         std::cout << "Structural Q4 pass-through; no variable-rate quantization performed." << std::endl;
     }

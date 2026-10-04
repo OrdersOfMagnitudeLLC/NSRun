@@ -84,6 +84,11 @@ option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 
+option(NS_INFER_ENABLED "nsrun: compile NSInfer sparse MLP op (CPU + CUDA)" ON)
+if (NS_INFER_ENABLED)
+    add_compile_definitions(NS_INFER_ENABLED)
+endif()
+
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 

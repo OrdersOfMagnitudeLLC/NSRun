@@ -262,6 +262,12 @@ bool GGUFParser::parse_metadata() {
                 // Store only first element for numeric types, skip entirely for strings
                 if (array_len > 0) {
                     switch (static_cast<GGUFType>(array_type)) {
+                        case GGUFType::BOOL: {
+                            uint8_t val = read_value<uint8_t>(offset);
+                            offset += sizeof(uint8_t);
+                            metadata_[key] = val;
+                            break;
+                        }
                         case GGUFType::UINT8: {
                             uint8_t val = read_value<uint8_t>(offset);
                             offset += sizeof(uint8_t);
@@ -365,6 +371,7 @@ bool GGUFParser::parse_metadata() {
                         switch (static_cast<GGUFType>(array_type)) {
                             case GGUFType::UINT8:
                             case GGUFType::INT8:
+                            case GGUFType::BOOL:
                                 elem_size = 1;
                                 break;
                             case GGUFType::UINT16:
@@ -474,6 +481,7 @@ bool GGUFParser::parse_tensors() {
                 switch (static_cast<GGUFType>(array_type)) {
                     case GGUFType::UINT8:
                     case GGUFType::INT8:
+                    case GGUFType::BOOL:
                         offset += array_len * sizeof(uint8_t);
                         break;
                     case GGUFType::UINT16:
