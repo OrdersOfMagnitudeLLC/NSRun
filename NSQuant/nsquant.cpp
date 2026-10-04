@@ -53,6 +53,7 @@ static bool parse_cold_tier(const std::string& s) {
     if      (u == "IQ2_XXS") g_cold_tier = GGMLType::IQ2_XXS;
     else if (u == "IQ1_S")   g_cold_tier = GGMLType::IQ1_S;
     else if (u == "Q2_K")    g_cold_tier = GGMLType::Q2_K;
+    else if (u == "Q3_K")    g_cold_tier = GGMLType::Q3_K;
     else if (u == "Q4_K")    g_cold_tier = GGMLType::Q4_K;
     else if (u == "Q8_0")    g_cold_tier = GGMLType::Q8_0;
     else return false;
@@ -66,6 +67,7 @@ static uint64_t elem_offset_bytes(GGMLType ty, size_t elems) {
     switch (ty) {
         case GGMLType::F16:  return (uint64_t)elems * sizeof(uint16_t);
         case GGMLType::BF16: return (uint64_t)elems * sizeof(uint16_t);
+        case GGMLType::Q3_K: return (uint64_t)(elems / QK_K) * sizeof(block_q3_K);
         case GGMLType::Q4_K: return (uint64_t)(elems / QK_K) * sizeof(block_q4_K);
         case GGMLType::Q5_K: return (uint64_t)(elems / QK_K) * sizeof(block_q5_K);
         case GGMLType::Q6_K: return (uint64_t)(elems / QK_K) * sizeof(block_q6_K);
@@ -263,6 +265,11 @@ static size_t quantize_to_type(const std::vector<float>& w, GGMLType ty, std::ve
             quantize_row_q2_K(w.data(), (block_q2_K*)out.data(), (int64_t)n);
             return out.size();
         }
+        case GGMLType::Q3_K: {
+            out.resize((n / QK_K) * sizeof(block_q3_K));
+            quantize_row_q3_K(w.data(), out.data(), (int64_t)n);
+            return out.size();
+        }
         case GGMLType::IQ1_S: {
             out.resize((n / QK_K) * sizeof(block_iq1_s));
             quantize_row_iq1_s(w.data(), out.data(), (int64_t)n);
@@ -357,6 +364,7 @@ static std::vector<std::vector<float>> build_prompt_inputs(const BPETokenizer& t
 int main(int argc, char** argv) {
     long long cli_hot_budget = -1;
     long long cli_warm_budget = -1;
+    double cli_cold_budget = -1.0;
     std::vector<std::string> pos;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -365,14 +373,21 @@ int main(int argc, char** argv) {
         else if (a == "--warm-budget" && i + 1 < argc) cli_warm_budget = std::atoll(argv[++i]);
         else if (a == "--cold-tier" && i + 1 < argc) {
             if (!parse_cold_tier(argv[++i])) {
-                std::cerr << "Unsupported --cold-tier type (valid: IQ2_XXS, IQ1_S, Q2_K, Q4_K, Q8_0)" << std::endl;
+                std::cerr << "Unsupported --cold-tier type (valid: IQ2_XXS, IQ1_S, Q2_K, Q3_K, Q4_K, Q8_0)" << std::endl;
+                return 1;
+            }
+        }
+        else if (a == "--cold-budget" && i + 1 < argc) {
+            cli_cold_budget = std::atof(argv[++i]);
+            if (cli_cold_budget < 0.0 || cli_cold_budget > 1.0) {
+                std::cerr << "--cold-budget must be a fraction in [0.0, 1.0]" << std::endl;
                 return 1;
             }
         }
         else pos.push_back(a);
     }
     if (pos.size() < 2) {
-        std::cerr << "Usage: " << argv[0] << " [--dequant-input] [--hot-budget N] [--warm-budget N] [--cold-tier TYPE] <input.gguf> <output.gguf> [n_prompts [prompts.txt]]" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [--dequant-input] [--hot-budget N] [--warm-budget N] [--cold-tier TYPE] [--cold-budget F] <input.gguf> <output.gguf> [n_prompts [prompts.txt]]" << std::endl;
         return 1;
     }
     const char* in_path = pos[0].c_str();
@@ -619,13 +634,28 @@ int main(int argc, char** argv) {
         acc += ent[top].elems;
         outs[ent[top].ti].clusters[ent[top].ci].quant_bits = 8;
     }
-    size_t wacc = 0;
+    size_t wacc = 0, warm_end = top;
     for (size_t j = top; j < ent.size() && wacc < warm_budget; ++j) {
         wacc += ent[j].elems;
         outs[ent[j].ti].clusters[ent[j].ci].quant_bits = 4;
+        warm_end = j + 1;
+    }
+    // --cold-budget caps the cold tier at a fraction of total_params: keep the
+    // lowest-scored tail cold (defaulted to 2 above) and promote the rest of
+    // the leftover to warm Q4_K.
+    size_t cold_budget = cli_cold_budget >= 0.0 ? (size_t)(total_params * cli_cold_budget)
+                                                : (size_t)(total_params * 0.70);
+    size_t cold_start = ent.size();
+    for (size_t k = ent.size(), cacc = 0; k > warm_end && cacc < cold_budget; ) {
+        cacc += ent[--k].elems;
+        cold_start = k;
+    }
+    for (size_t k = warm_end; k < cold_start; ++k) {
+        outs[ent[k].ti].clusters[ent[k].ci].quant_bits = 4;
     }
     std::cout << "Budget: total_params=" << total_params
               << " hot_budget=" << hot_budget << " warm_budget=" << warm_budget
+              << " cold_budget=" << cold_budget
               << " sorted_clusters=" << ent.size() << std::endl;
 
     // Per-tensor dominant class -> output type (forced overrides via min/max_bits)
@@ -660,7 +690,7 @@ int main(int argc, char** argv) {
         if (bits > J.max_bits) bits = J.max_bits;
         GGMLType out_type = (bits == 8) ? GGMLType::Q8_0 : (bits == 2) ? g_cold_tier : GGMLType::Q4_K;
         if (out_type == GGMLType::Q8_0 && !J.q8_ok) out_type = GGMLType::F16;
-        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::Q2_K ||
+        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::Q2_K || out_type == GGMLType::Q3_K ||
              out_type == GGMLType::IQ2_XXS || out_type == GGMLType::IQ1_S) && !J.kquant_ok)
             out_type = J.q8_ok ? GGMLType::Q8_0 : GGMLType::F16;
         to.quant_type = (uint32_t)out_type;

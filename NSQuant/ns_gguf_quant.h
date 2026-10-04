@@ -12,6 +12,7 @@
 #include "ns_q4k_quant.h"  // make_qkx2_quants, nearest_int, f32_to_fp16, block_q8_0 via ns_dequant.h
 #include "vendor/iq1_s_quant.h"  // block_iq1_s, quantize_row_iq1_s
 #include "vendor/iq2_xxs_quant.h"  // block_iq2_xxs, quantize_row_iq2_xxs (cold tier)
+#include "vendor/q3_k_quant.h"     // block_q3_K, quantize_row_q3_K (cold tier)
 
 // Q2_K block: 256 values, 2-bit quants + 4-bit packed scales/mins (84 bytes)
 typedef struct {
