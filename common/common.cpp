@@ -1988,6 +1988,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.kv_box = true;
         return true;
     }
+    if (arg == "--chat-wrap") {
+        params.chat_wrap = true;
+        return true;
+    }
     if (arg == "-dsatk" || arg == "--dsa-top-k") {
         CHECK_ARG
         params.dsa_top_k = std::stoi(argv[i]);
@@ -3123,12 +3127,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-nsi,  --ns-infer",             "enable NSInfer MLP sparsity (default: %s)", params.ns_infer ? "enabled" : "disabled" });
     options.push_back({ "*",           "       --ns-infer-threshold F",  "NSInfer energy retention threshold (default: %.2f)", (double)params.ns_infer_threshold });
     options.push_back({ "*",           "       --no-ns-attend",         "disable NSAttend sparse attention (overrides --ns-attend / LLAMA_ARG_NS_ATTEND)" });
+    options.push_back({ "*",           "       --force-ns-attend",      "apply NSAttend to recurrent/Mamba layers too on hybrid archs (default: gated to full-attention layers only)" });
     options.push_back({ "*",           "       --no-ns-infer",          "disable NSInfer MLP sparsity (overrides --ns-infer / LLAMA_ARG_NS_INFER)" });
     options.push_back({ "*",           "-mla,  --mla-use",              "enable MLA (default: %d)", params.mla_attn });
     options.push_back({ "*",           "-dsa,  --dsa",                  "enable GLM DSA sparse attention (GLM-DSA arch only; default: %s)", params.dsa ? "enabled" : "disabled" });
     options.push_back({ "*",           "-fidx,  --fused-indexer-topk",  "enable the fused indexer topk op (DSA only; default: %s)", params.fused_idx_topk ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --swa-compress",         "allocate sliding-window layers at window size instead of n_ctx (default: %s)", params.swa_compress ? "enabled" : "disabled" });
     options.push_back({ "*",           "        --kv-box",               "enable KVBox compressed KV cache mirroring (default: %s)", params.kv_box ? "enabled" : "disabled" });
+    options.push_back({ "*",           "        --chat-wrap",            "wrap -p prompt in ChatML template (<|im_start|>user...<|im_end|>\\n<|im_start|>assistant) for instruct models (default: %s)", params.chat_wrap ? "enabled" : "disabled" });
     options.push_back({ "*",           "-dsatk, --dsa-top-k",           "DSA top-k override; <0 uses the model's configured indexer_top_k (default: %d)", params.dsa_top_k });
     options.push_back({ "*",           "-amb,  --attention-max-batch",  "max batch size for attention computations (default: %d)", params.attn_max_batch});
     options.push_back({ "*",           "-no-fmoe, --no-fused-moe",      "disable fused MoE (default: %s)", params.fused_moe_up_gate ? "enabled" : "disabled" });
@@ -4397,6 +4403,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.flash_attn        = params.flash_attn;
     cparams.ns_attend         = params.ns_attend;
+    cparams.force_ns_attend   = params.force_ns_attend;
     cparams.ns_infer          = params.ns_infer;
     cparams.ns_infer_threshold = params.ns_infer_threshold;
     cparams.mla_attn          = params.mla_attn;

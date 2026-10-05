@@ -390,6 +390,12 @@ int main(int argc, char ** argv) {
         else {
             // otherwise use the prompt as is
             prompt = params.prompt;
+            // --chat-wrap: wrap raw -p prompts in ChatML so instruct models
+            // generate in assistant mode (raw text mode breaks NSInfer/MTP
+            // measurements — the model EOSes out instead of answering).
+            if (params.chat_wrap && !prompt.empty() && prompt.find("<|im_start|>") == std::string::npos) {
+                prompt = "<|im_start|>user\n" + prompt + "<|im_end|>\n<|im_start|>assistant\n";
+            }
         }
 
 

@@ -137,6 +137,29 @@ static int ggml_debug(struct ggml_tensor * t, bool ask, void * user_data) {
         ggml_print_tensor(data, t->type, t->ne, t->nb, 3);
     }
 
+    // NS_DUMP_TENSOR / NS_DUMP_FILE: append the named tensor's values as a
+    // [ne:int64][f32 payload] record so offline tooling can compare layer
+    // outputs across runs (e.g. cosine similarity vs a baseline run).
+    {
+        static const char * dump_name = getenv("NS_DUMP_TENSOR");
+        static const char * dump_file = getenv("NS_DUMP_FILE");
+        if (dump_name && dump_file && dump_name[0] && strcmp(t->name, dump_name) == 0 &&
+            (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16)) {
+            uint8_t * data = is_host ? (uint8_t *) t->data : cb_data->data.data();
+            int64_t ne = ggml_nelements(t);
+            FILE * f = fopen(dump_file, "ab");
+            if (f) {
+                fwrite(&ne, sizeof(ne), 1, f);
+                for (int64_t i = 0; i < ne; ++i) {
+                    float v = (t->type == GGML_TYPE_F16) ? ggml_fp16_to_fp32(((ggml_fp16_t *) data)[i])
+                                                         : ((float *) data)[i];
+                    fwrite(&v, sizeof(v), 1, f);
+                }
+                fclose(f);
+            }
+        }
+    }
+
     return 1;
 }
 

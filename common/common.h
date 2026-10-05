@@ -421,6 +421,7 @@ struct gpt_params {
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool flash_attn        = true;  // flash attention
     bool ns_attend         = false; // NSAttend sparse attention (requires flash_attn = false)
+    bool force_ns_attend   = false; // apply NSAttend even on recurrent (Mamba/SSM) layers of hybrid archs
     bool ns_infer          = false; // NSInfer dynamic MLP sparsity (energy threshold)
     float ns_infer_threshold = 0.75f; // NSInfer energy retention (0.75 = keep top 75% by energy)
     int  mla_attn          = 3;     // MLA 0: standard, 1: MLA with K and V^T cache, 2: MLA with just K cache, 3: the best of both worlds
@@ -435,6 +436,7 @@ struct gpt_params {
     bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx or --fused-indexer-topk)
     bool swa_compress      = false;
     bool kv_box            = false; // enable KVBox KV cache mirroring (off by default; opt-in via --kv-box)
+    bool chat_wrap         = false; // wrap -p prompt in ChatML (<|im_start|>user...assistant) for instruct models
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;

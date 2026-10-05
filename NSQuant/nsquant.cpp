@@ -225,8 +225,10 @@ static bool is_preserve(const std::string& name) {
 // llama.cpp expects them unquantized.
 static bool is_f32_tensor(const std::string& name) {
     if (is_preserve(name)) return false;
+    // Generic "norm.weight" suffix covers attn_norm, ffn_norm, output_norm,
+    // attn_q_norm, attn_k_norm (Qwen3/Nemotron QK norms) and future norm names.
     static const char* suffixes[] = {
-        "attn_norm.weight", "ffn_norm.weight", "output_norm.weight", ".bias"
+        "norm.weight", ".bias"
     };
     for (const char* s : suffixes) {
         size_t sl = strlen(s);
@@ -410,6 +412,46 @@ int main(int argc, char** argv) {
     const ModelParams& mp = parser.params();
     int n_embd = (int)mp.n_embd;
     if (n_embd == 0) n_embd = 64;
+
+    // Architecture detection: log it, and warn on tensor names that match no
+    // known pattern (blk.N.*, token_embd, output, *_norm, biases). Unrecognized
+    // 2D weight names won't be scored correctly — surface that loudly.
+    std::cout << "Architecture: " << (mp.architecture.empty() ? "(unknown)" : mp.architecture) << std::endl;
+    {
+        static const std::regex re_known(
+            "^(blk\\.[0-9]+\\..*|token_embd\\..*|output(_norm)?\\..*|pos_embd\\..*|.*norm\\..*|.*\\.bias)$");
+        int n_unknown = 0;
+        for (const auto& t : parser.tensors()) {
+            if (!std::regex_match(t.name, re_known)) {
+                if (n_unknown++ < 8)
+                    std::cerr << "Warning: unrecognized tensor name pattern: " << t.name << std::endl;
+            }
+        }
+        if (n_unknown > 8)
+            std::cerr << "Warning: ... and " << (n_unknown - 8) << " more unrecognized tensor names" << std::endl;
+    }
+
+    // Quantized-input gate: if the file carries no float-path weight tensors and
+    // --dequant-input was not given, pass 1 would skip every quantized tensor and
+    // produce sorted_clusters=0 -> a byte-identical passthrough copy. Auto-enable
+    // dequant when every non-float tensor is dequantizable; otherwise hard-warn.
+    if (!g_dequant_input) {
+        bool has_quant = false, has_nondequant = false;
+        for (const auto& t : parser.tensors()) {
+            if (t.type == GGMLType::F32 || t.type == GGMLType::F16 || t.type == GGMLType::BF16) continue;
+            if (is_dequant_type(t.type)) has_quant = true; else has_nondequant = true;
+        }
+        if (has_quant && !has_nondequant) {
+            g_dequant_input = true;
+            std::cout << "Input is already quantized; auto-enabling --dequant-input "
+                         "(all quant tensors are Q4_K/Q5_K/Q6_K/Q8_0)" << std::endl;
+        } else if (has_quant && has_nondequant) {
+            std::cerr << "Warning: input contains quantized tensors that are not dequantizable "
+                         "(Q2_K/IQ*/etc.). Those tensors will be passed through unquantized; "
+                         "rerun with --dequant-input on a Q4_K+ source for full tier scoring."
+                      << std::endl;
+        }
+    }
 
     // --dequant-input: reject tensor types we cannot dequantize (Q2_K, Q1/IQ*, etc.)
     if (g_dequant_input) {
@@ -657,6 +699,12 @@ int main(int argc, char** argv) {
               << " hot_budget=" << hot_budget << " warm_budget=" << warm_budget
               << " cold_budget=" << cold_budget
               << " sorted_clusters=" << ent.size() << std::endl;
+    if (ent.empty()) {
+        std::cerr << "WARNING: sorted_clusters=0 — no tensors were scored, output will be a "
+                     "passthrough copy. Causes: input already quantized without a dequantizable "
+                     "path, no quantizable 2D weight tensors, or unrecognized tensor names."
+                  << std::endl;
+    }
 
     // Per-tensor dominant class -> output type (forced overrides via min/max_bits)
     for (size_t ti = 0; ti < n_tensors; ++ti) {

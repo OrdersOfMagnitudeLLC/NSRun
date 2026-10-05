@@ -32,6 +32,7 @@ struct llama_cparams {
     bool offload_kqv;
     bool flash_attn;
     bool ns_attend;
+    bool force_ns_attend;
     bool ns_infer;
     float ns_infer_threshold;
     int  mla_attn;
