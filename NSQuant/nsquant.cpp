@@ -32,7 +32,7 @@ static const size_t CLUSTER_SIZE = 256;
 // activation_freq stores each cluster's Wanda importance score:
 //   importance_ij = |W_ij| * act_norm[j],  act_norm[j] = sum_samples ||x_j||
 // Clusters are ranked globally across all tensors; the top hot_budget
-// elements -> Q8_0, next warm_budget -> Q4_K, everything else -> cold tier
+// elements -> Q6_K, next warm_budget -> Q4_K, everything else -> cold tier
 // (see --hot-budget/--warm-budget/--cold-tier).
 
 // --dequant-input: treat Q4_K/Q5_K/Q6_K/Q8_0 input tensors as dequantizable to float
@@ -260,6 +260,11 @@ static size_t quantize_to_type(const std::vector<float>& w, GGMLType ty, std::ve
         case GGMLType::Q4_K: {
             out.resize((n / QK_K) * sizeof(block_q4_K));
             quantize_row_q4_K(w.data(), (block_q4_K*)out.data(), (int64_t)n);
+            return out.size();
+        }
+        case GGMLType::Q6_K: {
+            out.resize((n / QK_K) * sizeof(block_q6_K));
+            quantize_row_q6_K(w.data(), (block_q6_K*)out.data(), (int64_t)n);
             return out.size();
         }
         case GGMLType::Q2_K: {
@@ -648,7 +653,7 @@ int main(int argc, char** argv) {
     }
 
     // GLOBAL BUDGET: sort all profiled, non-forced clusters by Wanda importance.
-    // Top hot_budget -> Q8_0, next warm_budget -> Q4_K, everything else -> IQ1_S.
+    // Top hot_budget -> Q6_K, next warm_budget -> Q4_K, everything else -> cold tier.
     size_t total_params = 0;
     for (size_t ti = 0; ti < n_tensors; ++ti) {
         if (jobs[ti].quantizable) total_params += numel(parser.tensors()[ti]);
@@ -736,9 +741,9 @@ int main(int argc, char** argv) {
         else if (n_cold > n_warm && n_cold > n_hot) bits = 2;
         if (bits < J.min_bits) bits = J.min_bits;
         if (bits > J.max_bits) bits = J.max_bits;
-        GGMLType out_type = (bits == 8) ? GGMLType::Q8_0 : (bits == 2) ? g_cold_tier : GGMLType::Q4_K;
+        GGMLType out_type = (bits == 8) ? GGMLType::Q6_K : (bits == 2) ? g_cold_tier : GGMLType::Q4_K;
         if (out_type == GGMLType::Q8_0 && !J.q8_ok) out_type = GGMLType::F16;
-        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::Q2_K || out_type == GGMLType::Q3_K ||
+        if ((out_type == GGMLType::Q4_K || out_type == GGMLType::Q6_K || out_type == GGMLType::Q2_K || out_type == GGMLType::Q3_K ||
              out_type == GGMLType::IQ2_XXS || out_type == GGMLType::IQ1_S) && !J.kquant_ok)
             out_type = J.q8_ok ? GGMLType::Q8_0 : GGMLType::F16;
         to.quant_type = (uint32_t)out_type;
