@@ -2117,7 +2117,19 @@ static ggml_tensor * llm_build_kqv(
         cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
     } else {
 
-        if (cparams.ns_attend) {
+        // NSAttend engages only on full-attention layers. On hybrid archs
+        // (nemotron_h, qwen3next, qwen35...), recurrent/Mamba layers are marked
+        // by hparams.is_recurrent() and must use the dense path — NSAttend on
+        // SSM layers produces incoherent output. --force-ns-attend overrides.
+        bool ns_attend_ok = cparams.ns_attend &&
+                            (cparams.force_ns_attend || !hparams.is_recurrent(il));
+        if (cparams.ns_attend && !ns_attend_ok) {
+            static std::unordered_set<int> skipped_layers;
+            if (skipped_layers.insert(il).second) {
+                LLAMA_LOG_INFO("%s: NSAttend skipped on recurrent layer %d (use --force-ns-attend to override)\n", __func__, il);
+            }
+        }
+        if (ns_attend_ok) {
             // NSAttend sparse attention path
             // k is already [Dk, n_kv, n_head_kv] from the view above
             // Need v as [Dv, n_kv, n_head_kv] (not transposed)

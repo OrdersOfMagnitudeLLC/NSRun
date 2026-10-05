@@ -486,6 +486,7 @@ extern "C" {
         bool offload_kqv; // whether to offload the KQV ops (including the KV cache) to GPU
         bool flash_attn;  // whether to use flash attention [EXPERIMENTAL]
         bool ns_attend;   // whether to use NSAttend sparse attention [EXPERIMENTAL]
+        bool force_ns_attend; // apply NSAttend to recurrent/Mamba layers on hybrid archs (default: full-attention layers only)
         bool ns_infer;    // whether to use NSInfer MLP sparsity [EXPERIMENTAL]
         float ns_infer_threshold; // NSInfer energy retention (0.75 = keep top 75% by energy)
         int  mla_attn;    // whether to use MLA attention [EXPERIMENTAL]

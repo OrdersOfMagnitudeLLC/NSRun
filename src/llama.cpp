@@ -7845,6 +7845,7 @@ struct llama_context_params llama_context_default_params() {
         /*.offload_kqv                 =*/ true,
         /*.flash_attn                  =*/ true,
         /*.ns_attend                   =*/ false,
+        /*.force_ns_attend             =*/ false,
         /*.ns_infer                    =*/ false,
         /*.ns_infer_threshold          =*/ 0.75f,
         /*.mla_attn                    =*/ 3,
@@ -8339,6 +8340,7 @@ struct llama_context * llama_init_from_model(
     cparams.offload_kqv      = params.offload_kqv;
     cparams.flash_attn       = params.flash_attn;
     cparams.ns_attend        = params.ns_attend;
+    cparams.force_ns_attend  = params.force_ns_attend;
     cparams.ns_infer         = params.ns_infer;
     cparams.ns_infer_threshold = params.ns_infer_threshold;
     cparams.mla_attn         = params.mla_attn;
