@@ -8752,6 +8752,9 @@ struct llama_context * llama_init_from_model(
             const uint32_t n_kv_heads = hparams.n_head_kv(0);
             const uint32_t head_dim   = hparams.n_embd_head_k(0);
             ctx->kv_box.init(n_layer_kv, n_kv_heads, head_dim, kv_box_full_ctx);
+            // skip recurrent layers — no standard KV (mirrors ns-attend gate)
+            while (ctx->kv_box.retrieval_layer < n_layer_kv && hparams.is_recurrent(ctx->kv_box.retrieval_layer))
+                ctx->kv_box.retrieval_layer++;
             ctx->kv_slot_abs_pos.assign(kv_size, -1);
             LLAMA_LOG_INFO("%s: KVBox initialized: %u layers, %u heads, %u dim, %u slots, %.2f MiB (full ctx: %u)\n",
                     __func__, n_layer_kv, n_kv_heads, head_dim, (uint32_t)ctx->kv_box.n_slots,
@@ -12055,7 +12058,12 @@ void llama_kvbox_inject(struct llama_context * ctx) {
             {
                 const ggml_fp16_t* mx_l = pg.max_k.data();
                 const ggml_fp16_t* mn_l = pg.min_k.data();
-                const float* Q_l = Q_full.data() + (size_t)score_layer * q_lay_stride;
+                // retrieval_q slots are compacted attention-layer ordinals (rope_hit);
+                // map absolute layer index -> ordinal by skipping recurrent layers
+                uint32_t q_layer = 0;
+                for (uint32_t il_q = 0; il_q < score_layer; ++il_q)
+                    if (!hparams.is_recurrent(il_q)) ++q_layer;
+                const float* Q_l = Q_full.data() + (size_t)q_layer * q_lay_stride;
                 for (uint32_t h_kv = 0; h_kv < n_heads_kv; h_kv++) {
                     const ggml_fp16_t* mx = mx_l + h_kv * head_dim;
                     const ggml_fp16_t* mn = mn_l + h_kv * head_dim;
