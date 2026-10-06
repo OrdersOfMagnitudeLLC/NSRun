@@ -2525,6 +2525,7 @@ extern "C" {
             struct ggml_tensor  * k,
             struct ggml_tensor  * v,
             struct ggml_tensor  * mask,
+            struct ggml_tensor  * kv_pos,   // I32 [n_kv] seq pos per KV slot (NULL = slot==pos)
             float                 scale);
 
     // NSInfer: dynamic MLP sparsity via global mean-activation top-k.

@@ -5455,6 +5455,15 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 ? lctx.mtp_target_ctx->kv_self
                 : kv_self;
         const int64_t n_kv = mask_kv_self.n;
+        // ns-attend: true seq pos per buffer slot (handles KVBox remapping)
+        if (lctx.inp_kv_pos) {
+            int32_t * kvp = (int32_t *) lctx.inp_kv_pos->data;
+            const int64_t n_cells = std::min<int64_t>(lctx.inp_kv_pos->ne[0],
+                    (int64_t) mask_kv_self.cells.size());
+            for (int64_t i = 0; i < n_cells; ++i) {
+                kvp[i] = (int32_t) mask_kv_self.cells[i].pos;
+            }
+        }
         // openPangu: the NextN/MTP layers carry their own sliding window, and MTP graphs
         // run with mtp_op_type set, so the effective window is per-context.
         const uint32_t n_swa_eff = lctx.model.arch == LLM_ARCH_OPENPANGU &&

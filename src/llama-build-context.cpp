@@ -109,6 +109,7 @@ void llm_build_context::init() {
         lctx.inp_KQ_mask     = nullptr;
         lctx.inp_KQ_mask_swa = nullptr;
         lctx.inp_KQ_mask_swa_win = nullptr;
+        lctx.inp_kv_pos      = nullptr;
         lctx.swa_window_view = {};
         lctx.inp_K_shift     = nullptr;
         lctx.inp_mean        = nullptr;
@@ -2152,7 +2153,17 @@ static ggml_tensor * llm_build_kqv(
             }
             cb(v_ns, "v_ns", il);
 
-            cur = ggml_ns_attention(ctx, q, k, v_ns, kq_mask, kq_scale);
+            // seq pos per KV slot — KVBox injection/eviction remaps cells so
+            // slot j no longer holds position j; the op windows by seq pos.
+            if (lctx.inp_kv_pos == nullptr) {
+                lctx.inp_kv_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                        (int64_t) lctx.kv_self.cells.size());
+                cb(lctx.inp_kv_pos, "kv_pos", -1);
+                ggml_set_input(lctx.inp_kv_pos);
+            }
+            struct ggml_tensor * kv_pos = ggml_view_1d(ctx, lctx.inp_kv_pos,
+                    n_kv, (size_t) kv_view_offset*sizeof(int32_t));
+            cur = ggml_ns_attention(ctx, q, k, v_ns, kq_mask, kv_pos, kq_scale);
             cb(cur, "ns_attend", il);
 
             cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);

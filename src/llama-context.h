@@ -612,6 +612,7 @@ struct llama_context {
     struct ggml_tensor * inp_KQ_mask;     // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa; // F32 [kv_size, n_batch]
     struct ggml_tensor * inp_KQ_mask_swa_win = nullptr; // F32 [SWA W_view, n_batch]
+    struct ggml_tensor * inp_kv_pos = nullptr;    // I32 [n_cells] seq pos per KV slot (ns-attend)
     struct ggml_tensor * inp_K_shift;     // I32 [kv_size]
     struct ggml_tensor * inp_mean;        // F32 [n_batch, n_batch]
     struct ggml_tensor * inp_cls;         // I32 [n_batch]

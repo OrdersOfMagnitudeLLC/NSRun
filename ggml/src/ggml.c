@@ -10817,6 +10817,7 @@ GGML_API struct ggml_tensor * ggml_ns_attention(
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_pos,
         float                  scale) {
     GGML_ASSERT(q->ne[0] == k->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -10837,6 +10838,7 @@ GGML_API struct ggml_tensor * ggml_ns_attention(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+    result->src[4] = kv_pos;
 
     return result;
 }
@@ -22918,6 +22920,9 @@ static void ggml_compute_forward_ns_attention(
     const struct ggml_tensor * k_t = dst->src[1];
     const struct ggml_tensor * v_t = dst->src[2];
     const struct ggml_tensor * mask = dst->src[3];
+    // I32 [n_kv] seq pos per KV slot; NULL falls back to slot==pos.
+    // Required after KVBox injection — slots no longer map 1:1 to positions.
+    const int32_t * kvp = dst->src[4] ? (const int32_t *) dst->src[4]->data : NULL;
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
@@ -23014,11 +23019,13 @@ static void ggml_compute_forward_ns_attention(
                     sum += scores[j];
                 }
 
-                int q_pos = (int)(n_kv - n_tokens + i);
+                int q_pos = kvp ? (int)kvp[n_kv - n_tokens + i] : (int)(n_kv - n_tokens + i);
                 float mean_w = sum / n_kv;
                 float num = 0.0f, den_d = 0.0f, den_w = 0.0f;
                 for (int64_t j = 0; j < n_kv; j++) {
-                    float dist = (float)abs(q_pos - (int)j);
+                    int sp = kvp ? (int)kvp[j] : (int)j;
+                    if (sp < 0) continue;
+                    float dist = (float)abs(q_pos - sp);
                     float w = scores[j] / sum;
                     float d_diff = dist - (n_kv / 2.0f);
                     float w_diff = w - mean_w;
@@ -23042,10 +23049,16 @@ static void ggml_compute_forward_ns_attention(
             const char * q_ptr = (const char *)q_t->data + h * q_t->nb[2] + i * q_t->nb[1];
 
             int64_t j_start = 0, j_end = n_kv;
+            int q_seq_pos = kvp ? (int)kvp[n_kv - n_tokens + i] : (int)(n_kv - n_tokens + i);
             if (head_local) {
-                int q_pos = (int)(n_kv - n_tokens + i);
-                j_start = (q_pos - local_window) > 0 ? (q_pos - local_window) : 0;
-                j_end = ((int64_t)(q_pos + local_window + 1) < n_kv) ? (int64_t)(q_pos + local_window + 1) : n_kv;
+                if (kvp) {
+                    // slot indices do not track seq pos after KVBox
+                    // injection/eviction — filter by seq pos inside the loop
+                    j_start = 0; j_end = n_kv;
+                } else {
+                    j_start = (q_seq_pos - local_window) > 0 ? (q_seq_pos - local_window) : 0;
+                    j_end = ((int64_t)(q_seq_pos + local_window + 1) < n_kv) ? (int64_t)(q_seq_pos + local_window + 1) : n_kv;
+                }
             }
 
             float max_score = -1e30f;
@@ -23053,6 +23066,13 @@ static void ggml_compute_forward_ns_attention(
                 if (j < j_start || j >= j_end) {
                     scores[j] = -1e30f;
                     continue;
+                }
+                if (kvp && head_local) {
+                    int sp = (int)kvp[j];
+                    if (sp < 0 || sp < q_seq_pos - local_window || sp > q_seq_pos + local_window) {
+                        scores[j] = -1e30f;
+                        continue;
+                    }
                 }
                 const char * k_ptr = (const char *)k_t->data + hk * k_t->nb[2] + j * k_t->nb[1];
                 float dot = 0.0f;
