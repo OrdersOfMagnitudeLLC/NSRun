@@ -22924,6 +22924,15 @@ static void ggml_compute_forward_ns_attention(
     // Required after KVBox injection — slots no longer map 1:1 to positions.
     const int32_t * kvp = dst->src[4] ? (const int32_t *) dst->src[4]->data : NULL;
 
+    // newest cell pos = current decode position; current tokens may not
+    // occupy the last n_tokens slots after KVBox injection remaps cells.
+    int32_t ns_max_pos = -1;
+    if (kvp) {
+        for (int64_t j2 = 0; j2 < k_t->ne[1]; j2++) {
+            if ((int)kvp[j2] > ns_max_pos) ns_max_pos = (int)kvp[j2];
+        }
+    }
+
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
 
@@ -22988,6 +22997,7 @@ static void ggml_compute_forward_ns_attention(
                 fprintf(stderr, " %f", vv);
             }
             fprintf(stderr, "\n");
+
         }
 
         // Head type detection: sample 8 query rows
@@ -23019,7 +23029,7 @@ static void ggml_compute_forward_ns_attention(
                     sum += scores[j];
                 }
 
-                int q_pos = kvp ? (int)kvp[n_kv - n_tokens + i] : (int)(n_kv - n_tokens + i);
+                int q_pos = kvp ? (int)ns_max_pos - (int)(n_tokens - 1 - i) : (int)(n_kv - n_tokens + i);
                 float mean_w = sum / n_kv;
                 float num = 0.0f, den_d = 0.0f, den_w = 0.0f;
                 for (int64_t j = 0; j < n_kv; j++) {
@@ -23049,7 +23059,7 @@ static void ggml_compute_forward_ns_attention(
             const char * q_ptr = (const char *)q_t->data + h * q_t->nb[2] + i * q_t->nb[1];
 
             int64_t j_start = 0, j_end = n_kv;
-            int q_seq_pos = kvp ? (int)kvp[n_kv - n_tokens + i] : (int)(n_kv - n_tokens + i);
+            int q_seq_pos = kvp ? (int)ns_max_pos - (int)(n_tokens - 1 - i) : (int)(n_kv - n_tokens + i);
             if (head_local) {
                 if (kvp) {
                     // slot indices do not track seq pos after KVBox

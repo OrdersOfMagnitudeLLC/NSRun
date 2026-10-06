@@ -1722,6 +1722,33 @@ static std::vector<float> kvbox_rope_freqs(const llama_hparams & hparams,
     return freqs;
 }
 
+// V cache rows are transposed ([dim][cell]: dim stride = rows(il) elems, cell
+// stride = 1 elem) when v_trans is set; contiguous [cell][head][dim] otherwise.
+// Gather/scatter one head-width V slice of `cell` under either layout.
+static void kvbox_v_gather(const ggml_fp16_t * v_base, bool v_trans, uint32_t n_rows,
+                           uint32_t cell, uint32_t h, uint32_t hdim,
+                           size_t row_step, ggml_fp16_t * dst) {
+    if (v_trans) {
+        const ggml_fp16_t * p = v_base + (size_t)cell + (size_t)(h * hdim) * n_rows;
+        for (uint32_t d = 0; d < hdim; ++d) dst[d] = p[(size_t)d * n_rows];
+    } else {
+        memcpy(dst, (const char *)v_base + (size_t)cell * row_step + h * hdim * sizeof(ggml_fp16_t),
+               hdim * sizeof(ggml_fp16_t));
+    }
+}
+
+static void kvbox_v_scatter(ggml_fp16_t * v_base, bool v_trans, uint32_t n_rows,
+                            uint32_t cell, uint32_t h, uint32_t hdim,
+                            size_t row_step, const ggml_fp16_t * src) {
+    if (v_trans) {
+        ggml_fp16_t * p = v_base + (size_t)cell + (size_t)(h * hdim) * n_rows;
+        for (uint32_t d = 0; d < hdim; ++d) p[(size_t)d * n_rows] = src[d];
+    } else {
+        memcpy((char *)v_base + (size_t)cell * row_step + h * hdim * sizeof(ggml_fp16_t),
+               src, hdim * sizeof(ggml_fp16_t));
+    }
+}
+
 // Float variant of kvbox_rope_k for un-rotating Q vectors.
 static void kvbox_rope_f(float * q, uint32_t head_dim,
                          int64_t pos, const std::vector<float> & rope_freqs,
@@ -1863,18 +1890,25 @@ static bool llama_kv_cache_find_slot(
                     size_t v_step = 0;
                     if (has_v) {
                         v_step = lctx->cache_copies[2*il+1].step;
-                        if (v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) has_v = false;
+                        if (!cache.v_trans && v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) has_v = false;
                     }
 
                     const ggml_fp16_t* k_data = (const ggml_fp16_t*)
                         ((char*)cache.k_l[il]->data + (size_t)evict_idx * k_step);
-                    const ggml_fp16_t* v_data = has_v ? (const ggml_fp16_t*)
+                    const ggml_fp16_t* v_data = has_v && !cache.v_trans ? (const ggml_fp16_t*)
                         ((char*)cache.v_l[il]->data + (size_t)evict_idx * v_step) : nullptr;
+                    const uint32_t v_rows = has_v && cache.v_trans ? cache.rows(il) : 0;
+                    std::vector<ggml_fp16_t> v_row_e(has_v && cache.v_trans ? head_dim : 0);
 
                     std::vector<ggml_fp16_t> k_pre(head_dim);
                     for (uint32_t h = 0; h < n_kv_heads; ++h) {
                         const ggml_fp16_t* k_head = k_data + h * head_dim;
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
+                        if (has_v && cache.v_trans) {
+                            kvbox_v_gather((const ggml_fp16_t*)cache.v_l[il]->data, true, v_rows,
+                                           (uint32_t)evict_idx, h, head_dim, v_step, v_row_e.data());
+                            v_head = v_row_e.data();
+                        }
                         memcpy(k_pre.data(), k_head, head_dim * sizeof(ggml_fp16_t));
                         kvbox_rope_k(k_pre.data(), head_dim, -(int64_t)min_pos, rope_freqs, n_rot_kv);
                         lctx->kv_box.update_page_index(min_pos, il, h, k_head, k_pre.data());
@@ -6756,17 +6790,20 @@ static int llama_decode_internal(
                 size_t v_step = 0;
                 if (has_v) {
                     v_step = lctx.cache_copies[2*il+1].step;
-                    if (v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) {
+                    if (!kv_self.v_trans && v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) {
                         has_v = false;
                     }
                 }
+
+                const uint32_t v_rows = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
+                std::vector<ggml_fp16_t> v_row_m(has_v && kv_self.v_trans ? head_dim : 0);
 
                 std::vector<ggml_fp16_t> k_pre_mirror(head_dim);
                 for (uint32_t t = 0; t < n_tokens; ++t) {
                     const ggml_fp16_t* k_data = (const ggml_fp16_t*)
                         ((char*)kv_self.k_l[il]->data + (size_t)(cache_head + t) * k_step);
                     const ggml_fp16_t* v_data = nullptr;
-                    if (has_v) {
+                    if (has_v && !kv_self.v_trans) {
                         v_data = (const ggml_fp16_t*)
                             ((char*)kv_self.v_l[il]->data + (size_t)(cache_head + t) * v_step);
                     }
@@ -6774,6 +6811,11 @@ static int llama_decode_internal(
                     for (uint32_t h = 0; h < n_kv_heads; ++h) {
                         const ggml_fp16_t* k_head = k_data + h * head_dim;
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
+                        if (has_v && kv_self.v_trans) {
+                            kvbox_v_gather((const ggml_fp16_t*)kv_self.v_l[il]->data, true, v_rows,
+                                           (uint32_t)(cache_head + t), h, head_dim, v_step, v_row_m.data());
+                            v_head = v_row_m.data();
+                        }
                         memcpy(k_pre_mirror.data(), k_head, head_dim * sizeof(ggml_fp16_t));
                         kvbox_rope_k(k_pre_mirror.data(), head_dim, -k_pos, rope_freqs_mirror, n_rot_mirror);
                         lctx.kv_box.update_page_index(k_pos, il, h, k_head, k_pre_mirror.data());
@@ -12278,18 +12320,26 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                     size_t v_step = 0;
                     if (has_v) {
                         v_step = lctx.cache_copies[2*il+1].step;
-                        if (v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
+                        if (!kv_self.v_trans && v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
                     }
+                    const uint32_t v_rows_e = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
+                    std::vector<ggml_fp16_t> v_row_ie(has_v && kv_self.v_trans ? hdim_il : 0);
                     const ggml_fp16_t* ek = (const ggml_fp16_t*)
                         ((char*)kv_self.k_l[il]->data + (size_t)cell_idx * k_step);
-                    const ggml_fp16_t* ev = has_v ? (const ggml_fp16_t*)
+                    const ggml_fp16_t* ev = has_v && !kv_self.v_trans ? (const ggml_fp16_t*)
                         ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step) : nullptr;
                     std::vector<ggml_fp16_t> k_pre_evict(hdim_il);
                     for (uint32_t h = 0; h < n_heads_il; ++h) {
                         memcpy(k_pre_evict.data(), ek + h * hdim_il, hdim_il * sizeof(ggml_fp16_t));
                         kvbox_rope_k(k_pre_evict.data(), hdim_il, -(int64_t)orig_pos, rope_freqs, n_rot);
+                        const ggml_fp16_t* ev_head = ev ? ev + h * hdim_il : k_pre_evict.data();
+                        if (has_v && kv_self.v_trans) {
+                            kvbox_v_gather((const ggml_fp16_t*)kv_self.v_l[il]->data, true, v_rows_e,
+                                           cell_idx, h, hdim_il, v_step, v_row_ie.data());
+                            ev_head = v_row_ie.data();
+                        }
                         lctx.kv_box.write_slot((uint64_t)orig_pos, il, h,
-                            k_pre_evict.data(), ev ? ev + h * hdim_il : k_pre_evict.data());
+                            k_pre_evict.data(), ev_head);
                     }
                 }
             }
@@ -12309,8 +12359,9 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                 size_t v_step = 0;
                 if (has_v) {
                     v_step = lctx.cache_copies[2*il+1].step;
-                    if (v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
+                    if (!kv_self.v_trans && v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
                 }
+                const uint32_t v_rows_w = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
                 for (uint32_t h = 0; h < n_heads_il; ++h) {
                     if (!lctx.kv_box.read_slot((uint64_t)abs_pos, il, h, k_buf.data(), v_buf.data())) continue;
                     any_hit = true;
@@ -12319,9 +12370,14 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                         ((char*)kv_self.k_l[il]->data + (size_t)cell_idx * k_step + h * hdim_il * sizeof(ggml_fp16_t));
                     memcpy(dk, k_buf.data(), hdim_il * sizeof(ggml_fp16_t));
                     if (has_v) {
-                        ggml_fp16_t* dv = (ggml_fp16_t*)
-                            ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step + h * hdim_il * sizeof(ggml_fp16_t));
-                        memcpy(dv, v_buf.data(), hdim_il * sizeof(ggml_fp16_t));
+                        if (kv_self.v_trans) {
+                            kvbox_v_scatter((ggml_fp16_t*)kv_self.v_l[il]->data, true, v_rows_w,
+                                            cell_idx, h, hdim_il, v_step, v_buf.data());
+                        } else {
+                            ggml_fp16_t* dv = (ggml_fp16_t*)
+                                ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step + h * hdim_il * sizeof(ggml_fp16_t));
+                            memcpy(dv, v_buf.data(), hdim_il * sizeof(ggml_fp16_t));
+                        }
                     }
                 }
             }
