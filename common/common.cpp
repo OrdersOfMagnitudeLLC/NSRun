@@ -1988,6 +1988,10 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.kv_box = true;
         return true;
     }
+    if (arg == "--kvbox-cpu") {
+        params.kvbox_cpu = true;
+        return true;
+    }
     if (arg == "--chat-wrap") {
         params.chat_wrap = true;
         return true;
@@ -4418,6 +4422,7 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.fused_idx_topk    = params.fused_idx_topk;
     cparams.swa_compress      = params.swa_compress;
     cparams.kv_box            = params.kv_box;
+    cparams.kvbox_cpu        = params.kvbox_cpu;
     cparams.dsa_top_k         = params.dsa_top_k;
     cparams.k_cache_hadamard  = params.k_cache_hadamard;
     cparams.v_cache_hadamard  = params.v_cache_hadamard;

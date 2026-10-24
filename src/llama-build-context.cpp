@@ -546,6 +546,9 @@ ggml_tensor * llm_build_context::build_inp_out_ids() {
 
 ggml_tensor * llm_build_context::build_inp_KQ_mask(bool causal) {
     if (causal && flash_attn) {
+        // f16 mask for the flash kernel — used by flash_attn and by prefill
+        // (n_tokens > 1) batches that route to flash_attn_ext even when
+        // cparams.flash_attn is off (e.g. NSAttend decode-only mode).
         lctx.inp_KQ_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv, GGML_PAD(n_tokens, GGML_KQ_MASK_PAD));
         cb(lctx.inp_KQ_mask, "KQ_mask", -1);
         ggml_set_input(lctx.inp_KQ_mask);
@@ -2075,6 +2078,13 @@ static ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * cur;
 
+    // NSAttend engages only at decode (n_tokens == 1). Prefill batches go
+    // through flash_attn_ext — NSAttend over a full-KV batch is quadratic and
+    // was never meant for prefill. Decode-only ns_attend over the KVBox
+    // window is cheap. Recurrent/SSM layers also take the flash path.
+    const bool ns_attend_ok = cparams.ns_attend && (n_tokens == 1) &&
+                              (cparams.force_ns_attend || !hparams.is_recurrent(il));
+
     if (cparams.flash_attn) {
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
@@ -2122,8 +2132,6 @@ static ggml_tensor * llm_build_kqv(
         // (nemotron_h, qwen3next, qwen35...), recurrent/Mamba layers are marked
         // by hparams.is_recurrent() and must use the dense path — NSAttend on
         // SSM layers produces incoherent output. --force-ns-attend overrides.
-        bool ns_attend_ok = cparams.ns_attend &&
-                            (cparams.force_ns_attend || !hparams.is_recurrent(il));
         if (cparams.ns_attend && !ns_attend_ok) {
             static std::unordered_set<int> skipped_layers;
             if (skipped_layers.insert(il).second) {
@@ -2163,7 +2171,10 @@ static ggml_tensor * llm_build_kqv(
             }
             struct ggml_tensor * kv_pos = ggml_view_1d(ctx, lctx.inp_kv_pos,
                     n_kv, (size_t) kv_view_offset*sizeof(int32_t));
-            cur = ggml_ns_attention(ctx, q, k, v_ns, kq_mask, kv_pos, kq_scale);
+            // persistent per-layer head-locality buffer (src[5]): classify writes it
+            // at prefill, forward reads it at decode (LOCAL heads keep n_kv/4 window)
+            ggml_tensor * ht_in = (il < (int)lctx.kv_self.ns_head_type.size()) ? lctx.kv_self.ns_head_type[il] : nullptr;
+            cur = ggml_ns_attention(ctx, q, k, v_ns, kq_mask, kv_pos, ht_in, kq_scale);
             cb(cur, "ns_attend", il);
 
             cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);

@@ -841,12 +841,25 @@ bool llama_context::update_cache_copies() {
             const size_t n_floats = c.step / sizeof(ggml_fp16_t);
             ns_kvc_ensure_init(n_layers, n_floats);
             if (g_ns_kvc) {
-                const ggml_fp16_t* k_f16 = (const ggml_fp16_t*)
-                    ((char*)kv_self.k_l[il]->data + cache_head * c.step);
-                const ggml_fp16_t* v_f16 = (const ggml_fp16_t*)
-                    ((char*)kv_self.v_l[il]->data + cache_head * c.step);
-                g_ns_kvc->write((size_t)il, (size_t)cache_head,
-                                k_f16, v_f16, n_floats);
+                const size_t kv_off = (size_t)cache_head * c.step;
+                if (ggml_backend_buffer_is_host(kv_self.k_l[il]->buffer)) {
+                    const ggml_fp16_t* k_f16 = (const ggml_fp16_t*)
+                        ((char*)kv_self.k_l[il]->data + kv_off);
+                    const ggml_fp16_t* v_f16 = (const ggml_fp16_t*)
+                        ((char*)kv_self.v_l[il]->data + kv_off);
+                    g_ns_kvc->write((size_t)il, (size_t)cache_head,
+                                    k_f16, v_f16, n_floats);
+                } else {
+                    // KV lives on device: pull the slot back through the
+                    // backend instead of dereferencing a device pointer.
+                    static thread_local std::vector<ggml_fp16_t> k_scratch, v_scratch;
+                    if (k_scratch.size() < n_floats) k_scratch.resize(n_floats);
+                    if (v_scratch.size() < n_floats) v_scratch.resize(n_floats);
+                    ggml_backend_tensor_get(kv_self.k_l[il], k_scratch.data(), kv_off, c.step);
+                    ggml_backend_tensor_get(kv_self.v_l[il], v_scratch.data(), kv_off, c.step);
+                    g_ns_kvc->write((size_t)il, (size_t)cache_head,
+                                    k_scratch.data(), v_scratch.data(), n_floats);
+                }
             }
             }
             ns_kvc_skip:;
@@ -1630,6 +1643,20 @@ static bool llama_kv_cache_init(
             }
         }
     }
+    // Persistent per-layer NSAttend head-locality flags (aligned with k_l).
+    // Written by the classify kernel at prefill; read by the forward kernel at
+    // decode so LOCAL heads keep their n_kv/4 window instead of all-global.
+    if (cparams.ns_attend) {
+        for (int i = 0; i < n_layer; ++i) {
+            ggml_tensor * ht = nullptr;
+            if (i < (int)cache.k_l.size() && cache.k_l[i] != nullptr) {
+                struct ggml_context * hctx = ((split_cache || replicate_mla)) ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
+                ht = ggml_new_tensor_1d(hctx, GGML_TYPE_I32, hparams.n_head(i) + 1);
+                ggml_format_name(ht, "ns_ht_l%d", i);
+            }
+            cache.ns_head_type.push_back(ht);
+        }
+    }
     if (is_mla_attn && cparams.mla_attn && !llm_arch_is_hybrid(model.arch) && n_mla < n_kv_active_layers && n_mla > 0) {
         LLAMA_LOG_ERROR("%s: unexpected situation with %d out of %d active KV layers having MLA enabled\n", __func__, n_mla, n_kv_active_layers);
         LLAMA_LOG_ERROR("%s: bailing out\n", __func__);
@@ -1735,6 +1762,171 @@ static void kvbox_v_gather(const ggml_fp16_t * v_base, bool v_trans, uint32_t n_
         memcpy(dst, (const char *)v_base + (size_t)cell * row_step + h * hdim * sizeof(ggml_fp16_t),
                hdim * sizeof(ggml_fp16_t));
     }
+}
+
+// NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
+// KVBox paths read/write KV cache tensors via plain host pointers. When the
+// tensor lives on a device buffer those accesses fault, so stage the layer
+// through the backend and commit it back after mutation.
+static char * kvbox_stage(ggml_tensor * t, std::vector<char> & scratch) {
+    if (!t) return nullptr;
+    if (ggml_backend_buffer_is_host(t->buffer)) return (char *)t->data;
+    const size_t n = ggml_nbytes(t);
+    if (scratch.size() < n) scratch.resize(n);
+    ggml_backend_tensor_get(t, scratch.data(), 0, n);
+    return scratch.data();
+}
+
+static void kvbox_commit(ggml_tensor * t, const std::vector<char> & scratch) {
+    if (!t || scratch.empty()) return;
+    ggml_backend_tensor_set(t, scratch.data(), 0, scratch.size());
+}
+
+// KVBox GPU path — wrappers exported from libggml (ggml-cuda/kvbox.cu).
+extern "C" {
+    void * kvbox_cuda_store_alloc(size_t bytes);
+    void   kvbox_cuda_store_free(void * p);
+    void * kvbox_cuda_malloc(size_t bytes);
+    void   kvbox_cuda_free(void * p);
+    void   kvbox_cuda_upload(void * dst_dev, const void * src_host, size_t bytes);
+    void   kvbox_cuda_write_slot(const void * k_row_dev, const void * v_row_dev,
+            int v_trans, long long v_rows, long long v_cell, size_t v_step,
+            const float * rope_freqs_dev, int n_rot, long long pos,
+            int n_kv_heads, int head_dim,
+            void * store_dev, int layer, int slot, int max_slots);
+    void   kvbox_cuda_read_slot(void * k_row_dev, void * v_row_dev,
+            int v_trans, long long v_rows, long long v_cell, size_t v_step,
+            const float * rope_freqs_dev, int n_rot, long long pos,
+            int n_kv_heads, int head_dim,
+            const void * store_dev, int layer, int slot, int max_slots);
+    void   kvbox_cuda_download(void * dst_host, const void * src_dev, size_t bytes);
+    void   kvbox_cuda_sync();
+}
+
+void KVBox::ensure_gpu_store(uint32_t layers, uint32_t heads, uint32_t dim,
+                             uint32_t slots, const std::vector<float> & freqs) {
+    if (gpu_store && n_layers == layers && n_kv_heads == heads && head_dim == dim
+            && dev_max_slots == slots) return;
+    free_gpu_store();
+    n_layers = layers; n_kv_heads = heads; head_dim = dim; dev_max_slots = slots;
+    entry_bytes = (size_t)heads * dim * 2 + (size_t)heads * 2 * sizeof(ggml_fp16_t);
+    const size_t bytes = (size_t)layers * slots * entry_bytes;
+    dev_store = kvbox_cuda_store_alloc(bytes);
+    slot_pos.assign(slots, -1);
+    if (dev_store) gpu_store = true;
+    if (!freqs.empty()) {
+        dev_rope_freqs = (float *)kvbox_cuda_malloc(freqs.size() * sizeof(float));
+        if (dev_rope_freqs) {
+            kvbox_cuda_upload(dev_rope_freqs, freqs.data(), freqs.size() * sizeof(float));
+            dev_rope_n = (uint32_t)freqs.size();
+        }
+    }
+}
+
+void KVBox::free_gpu_store() {
+    if (dev_store) { kvbox_cuda_store_free(dev_store); dev_store = nullptr; }
+    if (dev_rope_freqs) { kvbox_cuda_free(dev_rope_freqs); dev_rope_freqs = nullptr; }
+    gpu_store = false;
+}
+
+// GPU write path: quantize one position's K+V for a layer on device into
+// compressed_kv_store, then fetch the small compressed entry (D2H ~2KB) into
+// kv_buffer so the CPU inject path keeps working until reads move to device.
+static void kvbox_gpu_write_pos(llama_context & lctx, int64_t pos, int il,
+        const ggml_tensor * k_t, const ggml_tensor * v_t, uint32_t cell_idx,
+        size_t k_step, size_t v_step, bool v_trans, uint32_t v_rows,
+        const std::vector<float> & freqs, uint32_t n_rot) {
+    KVBox & kb = lctx.kv_box;
+    const uint32_t heads = lctx.model.hparams.n_head_kv(il);
+    const uint32_t dim   = lctx.model.hparams.n_embd_head_k(il);
+    kb.ensure_gpu_store(kb.n_layers, heads, dim, (uint32_t)kb.max_positions, freqs);
+    if (!kb.gpu_store) return;
+    const int slot = (int)(pos % kb.dev_max_slots);
+    const void * k_row = (const char *)k_t->data + (size_t)cell_idx * k_step;
+    // For v_trans the slot is the innermost index (v_cell in the kernel), so the
+    // row base is the tensor base — do NOT offset by cell_idx (double-counts).
+    const void * v_row = v_t ? ((const char *)v_t->data + (v_trans ? 0 : (size_t)cell_idx * v_step)) : nullptr;
+    kvbox_cuda_write_slot(k_row, v_row, v_trans ? 1 : 0, (long long)v_rows,
+        (long long)cell_idx, v_step, kb.dev_rope_freqs, n_rot, (long long)pos,
+        (int)heads, (int)dim, kb.dev_store, il, slot, (int)kb.dev_max_slots);
+    if (getenv("KVBOX_DBG")) {
+        kvbox_cuda_sync();
+        fprintf(stderr, "[KVBOX-W] il=%d cell=%u k_step=%zu pos=%lld kptr=%p kne=%lld,%lld vne=%lld,%lld vt=%d vr=%u vstep=%zu\n",
+            il, cell_idx, k_step, (long long)pos, k_t ? k_t->data : nullptr,
+            k_t ? (long long)k_t->ne[0] : 0LL, k_t ? (long long)k_t->ne[1] : 0LL,
+            v_t ? (long long)v_t->ne[0] : -1LL, v_t ? (long long)v_t->ne[1] : -1LL,
+            v_trans ? 1 : 0, v_rows, v_step);
+    }
+    if (slot >= 0 && slot < (int)kb.slot_pos.size()) kb.slot_pos[slot] = pos;
+    // Populate kv_buffer only for the retrieval layer — it feeds the host-side
+    // query_content_k retrieval scoring. The inject path now reads the device
+    // store directly, so the other layers' kv_buffer slices are unused.
+    if (il == (int)kb.retrieval_layer) {
+    kvbox_cuda_sync();
+    const size_t ent = kb.entry_bytes;
+    std::vector<char> buf(ent);
+    kvbox_cuda_download(buf.data(),
+        (const char *)kb.dev_store + ((size_t)il * kb.dev_max_slots + slot) * ent, ent);
+    if (kb.kv_buffer.find(pos) == kb.kv_buffer.end()
+            && kb.kv_buffer.size() >= kb.max_positions && !kb.write_order.empty()) {
+        int64_t evict_pos = kb.write_order.front(); kb.write_order.pop();
+        kb.kv_buffer.erase(evict_pos); kb.kv_scales.erase(evict_pos);
+        kb.total_bytes -= kb.per_pos_bytes;
+    }
+    auto & kv = kb.kv_buffer[pos];
+    auto & sc = kb.kv_scales[pos];
+    if (kv.empty()) {
+        kv.assign((size_t)kb.n_layers * heads * 2 * dim, 0);
+        sc.assign((size_t)kb.n_layers * heads * 2, (ggml_fp16_t)0);
+        kb.write_order.push(pos);
+        kb.total_bytes += kb.per_pos_bytes;
+    }
+    const int8_t * kc = (const int8_t *)buf.data();
+    const int8_t * vc = kc + (size_t)heads * dim;
+    const ggml_fp16_t * gsc = (const ggml_fp16_t *)(buf.data() + (size_t)heads * dim * 2);
+    for (uint32_t h = 0; h < heads; ++h) {
+        memcpy(kv.data() + (size_t)(il * heads + h) * dim, kc + (size_t)h * dim, dim);
+        memcpy(kv.data() + (size_t)(kb.n_layers * heads + il * heads + h) * dim,
+               vc + (size_t)h * dim, dim);
+        sc[(il * heads + h) * 2 + 0] = gsc[h * 2 + 0];
+        sc[(il * heads + h) * 2 + 1] = gsc[h * 2 + 1];
+    }
+    }
+    // QUEST page index for the retrieval layer: fetch the raw (post-RoPE) K
+    // row for this slot (small D2H), un-rotate on host, update the page index.
+    if (il == (int)kb.retrieval_layer) {
+        std::vector<ggml_fp16_t> krow((size_t)heads * dim);
+        kvbox_cuda_download(krow.data(), k_row, krow.size() * sizeof(ggml_fp16_t));
+        std::vector<ggml_fp16_t> k_pre(dim);
+        for (uint32_t h = 0; h < heads; ++h) {
+            memcpy(k_pre.data(), krow.data() + (size_t)h * dim, dim * sizeof(ggml_fp16_t));
+            kvbox_rope_k(k_pre.data(), dim, -(int64_t)pos, freqs, n_rot);
+            kb.update_page_index(pos, il, h, krow.data() + (size_t)h * dim, k_pre.data());
+        }
+    }
+    kb.writes++;
+}
+
+// GPU inject path: reconstruct one (pos, layer) slot's K+V from
+// compressed_kv_store straight into the working-cache tensors on device.
+// Returns true on a store hit (slot holds pos), false on a miss.
+static bool kvbox_gpu_inject_pos(llama_context & lctx, int64_t pos, int il,
+        ggml_tensor * k_t, ggml_tensor * v_t, uint32_t cell_idx,
+        size_t k_step, size_t v_step, bool v_trans, uint32_t v_rows,
+        uint32_t n_rot) {
+    KVBox & kb = lctx.kv_box;
+    if (!kb.gpu_store) return false;
+    const int slot = (int)(pos % kb.dev_max_slots);
+    if (slot < 0 || slot >= (int)kb.slot_pos.size() || kb.slot_pos[slot] != pos)
+        return false;
+    const uint32_t heads = lctx.model.hparams.n_head_kv(il);
+    const uint32_t dim   = lctx.model.hparams.n_embd_head_k(il);
+    void * k_row = (char *)k_t->data + (size_t)cell_idx * k_step;
+    void * v_row = v_t ? ((char *)v_t->data + (v_trans ? 0 : (size_t)cell_idx * v_step)) : nullptr;
+    kvbox_cuda_read_slot(k_row, v_row, v_trans ? 1 : 0, (long long)v_rows,
+        (long long)cell_idx, v_step, kb.dev_rope_freqs, n_rot, (long long)pos,
+        (int)heads, (int)dim, kb.dev_store, il, slot, (int)kb.dev_max_slots);
+    return true;
 }
 
 static void kvbox_v_scatter(ggml_fp16_t * v_base, bool v_trans, uint32_t n_rows,
@@ -1893,11 +2085,24 @@ static bool llama_kv_cache_find_slot(
                         if (!cache.v_trans && v_step < head_dim * n_kv_heads * sizeof(ggml_fp16_t)) has_v = false;
                     }
 
-                    const ggml_fp16_t* k_data = (const ggml_fp16_t*)
-                        ((char*)cache.k_l[il]->data + (size_t)evict_idx * k_step);
-                    const ggml_fp16_t* v_data = has_v && !cache.v_trans ? (const ggml_fp16_t*)
-                        ((char*)cache.v_l[il]->data + (size_t)evict_idx * v_step) : nullptr;
                     const uint32_t v_rows = has_v && cache.v_trans ? cache.rows(il) : 0;
+                    if (!ggml_backend_buffer_is_host(cache.k_l[il]->buffer) && !lctx->cparams.kvbox_cpu) {
+                        // GPU write path: kernel reads the slot on device and
+                        // writes compressed codes to compressed_kv_store — no
+                        // full-tensor D2H. ~2KB codes readback keeps kv_buffer /
+                        // inject working until the read path also moves to device.
+                        kvbox_gpu_write_pos(*lctx, (int64_t)min_pos, il,
+                            cache.k_l[il], has_v ? cache.v_l[il] : nullptr,
+                            (uint32_t)evict_idx, k_step, v_step, cache.v_trans,
+                            v_rows, rope_freqs, n_rot_kv);
+                    } else {
+                    std::vector<char> k_stage_e, v_stage_e;
+                    const char * k_host_e = kvbox_stage(cache.k_l[il], k_stage_e);
+                    const char * v_host_e = has_v ? kvbox_stage(cache.v_l[il], v_stage_e) : nullptr;
+                    const ggml_fp16_t* k_data = (const ggml_fp16_t*)
+                        (k_host_e + (size_t)evict_idx * k_step);
+                    const ggml_fp16_t* v_data = has_v && !cache.v_trans ? (const ggml_fp16_t*)
+                        (v_host_e + (size_t)evict_idx * v_step) : nullptr;
                     std::vector<ggml_fp16_t> v_row_e(has_v && cache.v_trans ? head_dim : 0);
 
                     std::vector<ggml_fp16_t> k_pre(head_dim);
@@ -1905,7 +2110,7 @@ static bool llama_kv_cache_find_slot(
                         const ggml_fp16_t* k_head = k_data + h * head_dim;
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
                         if (has_v && cache.v_trans) {
-                            kvbox_v_gather((const ggml_fp16_t*)cache.v_l[il]->data, true, v_rows,
+                            kvbox_v_gather((const ggml_fp16_t*)v_host_e, true, v_rows,
                                            (uint32_t)evict_idx, h, head_dim, v_step, v_row_e.data());
                             v_head = v_row_e.data();
                         }
@@ -1913,6 +2118,7 @@ static bool llama_kv_cache_find_slot(
                         kvbox_rope_k(k_pre.data(), head_dim, -(int64_t)min_pos, rope_freqs, n_rot_kv);
                         lctx->kv_box.update_page_index(min_pos, il, h, k_head, k_pre.data());
                         lctx->kv_box.write_slot(min_pos, il, h, k_pre.data(), v_head);
+                    }
                     }
                 }
 
@@ -6796,23 +7002,35 @@ static int llama_decode_internal(
                 }
 
                 const uint32_t v_rows = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
+                if (!ggml_backend_buffer_is_host(kv_self.k_l[il]->buffer) && !lctx.cparams.kvbox_cpu) {
+                    // GPU write path — no full-tensor D2H.
+                    for (uint32_t t = 0; t < n_tokens; ++t) {
+                        int64_t k_pos = (int64_t)(lctx.kv_box.abs_pos + t);
+                        kvbox_gpu_write_pos(lctx, k_pos, il, kv_self.k_l[il],
+                            has_v ? kv_self.v_l[il] : nullptr,
+                            (uint32_t)(cache_head + t), k_step, v_step,
+                            kv_self.v_trans, v_rows, rope_freqs_mirror, n_rot_mirror);
+                    }
+                } else {
                 std::vector<ggml_fp16_t> v_row_m(has_v && kv_self.v_trans ? head_dim : 0);
-
                 std::vector<ggml_fp16_t> k_pre_mirror(head_dim);
+                std::vector<char> k_stage_m, v_stage_m;
+                const char * k_host_m = kvbox_stage(kv_self.k_l[il], k_stage_m);
+                const char * v_host_m = has_v ? kvbox_stage(kv_self.v_l[il], v_stage_m) : nullptr;
                 for (uint32_t t = 0; t < n_tokens; ++t) {
                     const ggml_fp16_t* k_data = (const ggml_fp16_t*)
-                        ((char*)kv_self.k_l[il]->data + (size_t)(cache_head + t) * k_step);
+                        (k_host_m + (size_t)(cache_head + t) * k_step);
                     const ggml_fp16_t* v_data = nullptr;
                     if (has_v && !kv_self.v_trans) {
                         v_data = (const ggml_fp16_t*)
-                            ((char*)kv_self.v_l[il]->data + (size_t)(cache_head + t) * v_step);
+                            (v_host_m + (size_t)(cache_head + t) * v_step);
                     }
                     int64_t k_pos = (int64_t)(lctx.kv_box.abs_pos + t);
                     for (uint32_t h = 0; h < n_kv_heads; ++h) {
                         const ggml_fp16_t* k_head = k_data + h * head_dim;
                         const ggml_fp16_t* v_head = v_data ? v_data + h * head_dim : k_head;
                         if (has_v && kv_self.v_trans) {
-                            kvbox_v_gather((const ggml_fp16_t*)kv_self.v_l[il]->data, true, v_rows,
+                            kvbox_v_gather((const ggml_fp16_t*)v_host_m, true, v_rows,
                                            (uint32_t)(cache_head + t), h, head_dim, v_step, v_row_m.data());
                             v_head = v_row_m.data();
                         }
@@ -6821,6 +7039,7 @@ static int llama_decode_internal(
                         lctx.kv_box.update_page_index(k_pos, il, h, k_head, k_pre_mirror.data());
                         lctx.kv_box.write_slot((uint64_t)k_pos, il, h, k_pre_mirror.data(), v_head);
                     }
+                }
                 }
             }
             lctx.kv_box.abs_pos += n_tokens;
@@ -7911,6 +8130,7 @@ struct llama_context_params llama_context_default_params() {
         /*.fused_idx_topk              =*/ true,
         /*.swa_compress                =*/ false,
         /*.kv_box                      =*/ false,
+        /*.kvbox_cpu                   =*/ false,
         /*.dsa_top_k                   =*/ -1,
         /*.min_experts                 =*/ -1,
         /*.thtesh_experts              =*/ 0.0f,
@@ -8406,6 +8626,7 @@ struct llama_context * llama_init_from_model(
     cparams.fused_idx_topk   = params.fused_idx_topk;
     cparams.swa_compress     = params.swa_compress;
     cparams.kv_box           = params.kv_box;
+    cparams.kvbox_cpu        = params.kvbox_cpu;
     cparams.dsa_top_k        = params.dsa_top_k;
 
     if (cparams.swa_compress != model->swa_compress) {
@@ -8612,6 +8833,12 @@ struct llama_context * llama_init_from_model(
     if (cparams.kv_box) {
         kv_box_full_ctx = kv_size;
         kv_size = cparams.n_batch;
+        // NSAttend: bound the working cache to ~512 injected + 128 recent so the
+        // sparse kernel attends over ~512 slots (LOCAL heads window n_kv/4 ~128)
+        // rather than the full n_batch. This is what makes ns-attend fast.
+        if (cparams.ns_attend) {
+            kv_size = std::min(kv_size, (uint32_t) 512);
+        }
         // Keep cparams.n_ctx at full context size so generation isn't cut short.
         // The working KV cache is smaller (n_batch), but KVBox mirrors writes
         // to the compressed cache. Attention sees the working cache window.
@@ -12277,6 +12504,7 @@ void llama_kvbox_inject(struct llama_context * ctx) {
     printf("[KVBox post-prefill] inject capacity: %u (n_free=%u, n_evict=%zu, max_inject=%u)\n",
            n_inject_capacity, n_free, evict_cells.size(), max_inject);
 
+    int n_populated = 0;
     if (n_inject_capacity > 0 && !scored.empty()) {
         std::vector<ggml_fp16_t> k_buf(head_dim);
         std::vector<ggml_fp16_t> v_buf(head_dim);
@@ -12323,23 +12551,34 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                         if (!kv_self.v_trans && v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
                     }
                     const uint32_t v_rows_e = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
+                    if (!ggml_backend_buffer_is_host(kv_self.k_l[il]->buffer) && !lctx.cparams.kvbox_cpu) {
+                        // GPU write path — no full-tensor D2H.
+                        kvbox_gpu_write_pos(lctx, (int64_t)orig_pos, il,
+                            kv_self.k_l[il], has_v ? kv_self.v_l[il] : nullptr,
+                            cell_idx, k_step, v_step, kv_self.v_trans,
+                            v_rows_e, rope_freqs, n_rot);
+                    } else {
                     std::vector<ggml_fp16_t> v_row_ie(has_v && kv_self.v_trans ? hdim_il : 0);
+                    std::vector<char> k_stage_s, v_stage_s;
+                    const char * k_host_s = kvbox_stage(kv_self.k_l[il], k_stage_s);
+                    const char * v_host_s = has_v ? kvbox_stage(kv_self.v_l[il], v_stage_s) : nullptr;
                     const ggml_fp16_t* ek = (const ggml_fp16_t*)
-                        ((char*)kv_self.k_l[il]->data + (size_t)cell_idx * k_step);
+                        (k_host_s + (size_t)cell_idx * k_step);
                     const ggml_fp16_t* ev = has_v && !kv_self.v_trans ? (const ggml_fp16_t*)
-                        ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step) : nullptr;
+                        (v_host_s + (size_t)cell_idx * v_step) : nullptr;
                     std::vector<ggml_fp16_t> k_pre_evict(hdim_il);
                     for (uint32_t h = 0; h < n_heads_il; ++h) {
                         memcpy(k_pre_evict.data(), ek + h * hdim_il, hdim_il * sizeof(ggml_fp16_t));
                         kvbox_rope_k(k_pre_evict.data(), hdim_il, -(int64_t)orig_pos, rope_freqs, n_rot);
                         const ggml_fp16_t* ev_head = ev ? ev + h * hdim_il : k_pre_evict.data();
                         if (has_v && kv_self.v_trans) {
-                            kvbox_v_gather((const ggml_fp16_t*)kv_self.v_l[il]->data, true, v_rows_e,
+                            kvbox_v_gather((const ggml_fp16_t*)v_host_s, true, v_rows_e,
                                            cell_idx, h, hdim_il, v_step, v_row_ie.data());
                             ev_head = v_row_ie.data();
                         }
                         lctx.kv_box.write_slot((uint64_t)orig_pos, il, h,
                             k_pre_evict.data(), ev_head);
+                    }
                     }
                 }
             }
@@ -12362,23 +12601,39 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                     if (!kv_self.v_trans && v_step < (size_t)n_heads_il * hdim_il * sizeof(ggml_fp16_t)) has_v = false;
                 }
                 const uint32_t v_rows_w = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
+                if (!ggml_backend_buffer_is_host(kv_self.k_l[il]->buffer) && !lctx.cparams.kvbox_cpu) {
+                    // GPU inject path: decompress + re-rotate on device, write
+                    // K/V straight into the working-cache tensors. No D2H/H2D.
+                    if (kvbox_gpu_inject_pos(lctx, (int64_t)abs_pos, il,
+                            kv_self.k_l[il], has_v ? kv_self.v_l[il] : nullptr,
+                            cell_idx, k_step, v_step, kv_self.v_trans,
+                            v_rows_w, n_rot)) {
+                        any_hit = true;
+                    }
+                } else {
+                std::vector<char> k_stage_w, v_stage_w;
+                char * k_host_w = kvbox_stage(kv_self.k_l[il], k_stage_w);
+                char * v_host_w = has_v ? kvbox_stage(kv_self.v_l[il], v_stage_w) : nullptr;
                 for (uint32_t h = 0; h < n_heads_il; ++h) {
                     if (!lctx.kv_box.read_slot((uint64_t)abs_pos, il, h, k_buf.data(), v_buf.data())) continue;
                     any_hit = true;
                     kvbox_rope_k(k_buf.data(), hdim_il, (int64_t)abs_pos, rope_freqs, n_rot);
                     ggml_fp16_t* dk = (ggml_fp16_t*)
-                        ((char*)kv_self.k_l[il]->data + (size_t)cell_idx * k_step + h * hdim_il * sizeof(ggml_fp16_t));
+                        ((char*)k_host_w + (size_t)cell_idx * k_step + h * hdim_il * sizeof(ggml_fp16_t));
                     memcpy(dk, k_buf.data(), hdim_il * sizeof(ggml_fp16_t));
                     if (has_v) {
                         if (kv_self.v_trans) {
-                            kvbox_v_scatter((ggml_fp16_t*)kv_self.v_l[il]->data, true, v_rows_w,
+                            kvbox_v_scatter((ggml_fp16_t*)v_host_w, true, v_rows_w,
                                             cell_idx, h, hdim_il, v_step, v_buf.data());
                         } else {
                             ggml_fp16_t* dv = (ggml_fp16_t*)
-                                ((char*)kv_self.v_l[il]->data + (size_t)cell_idx * v_step + h * hdim_il * sizeof(ggml_fp16_t));
+                                ((char*)v_host_w + (size_t)cell_idx * v_step + h * hdim_il * sizeof(ggml_fp16_t));
                             memcpy(dv, v_buf.data(), hdim_il * sizeof(ggml_fp16_t));
                         }
                     }
+                }
+                kvbox_commit(kv_self.k_l[il], k_stage_w);
+                if (has_v) kvbox_commit(kv_self.v_l[il], v_stage_w);
                 }
             }
 
@@ -12387,6 +12642,7 @@ void llama_kvbox_inject(struct llama_context * ctx) {
                 kv_self.cells[cell_idx].seq_id.clear();
                 kv_self.cells[cell_idx].seq_id.insert(0);
                 lctx.kv_box.retrievals++;
+                n_populated++;
                 if (cell_idx > max_cell) max_cell = cell_idx;
             }
         }
@@ -12397,6 +12653,7 @@ void llama_kvbox_inject(struct llama_context * ctx) {
         if (new_n > kv_self.n) {
             kv_self.n = new_n;
         }
+        fprintf(stderr, "[KVBox inject] populated %d / %u, kv_self.n=%u\n", n_populated, n_inject_capacity, kv_self.n);
     }
 
     lctx.kv_box.clear_score_buffer();

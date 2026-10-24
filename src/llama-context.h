@@ -133,6 +133,13 @@ struct llama_kv_cache {
     // Empty unless the model has the DSA indexer.
     std::vector<struct ggml_tensor *> kr_l;
 
+    // Persistent NSAttend head-locality flags: [n_layer_kv][n_head] I32. Written by
+    // the classify kernel at prefill (n_tokens>=16), read by the forward kernel at
+    // decode (n_tokens<16) so LOCAL heads keep their n_kv/4 window instead of
+    // defaulting to all-global. Device-resident; survives across decode steps.
+    // Invalidated on context clear.
+    std::vector<struct ggml_tensor *> ns_head_type; // per layer [n_head] I32
+
     // When true, the delta_net graph builder will enable per-step SSM state saves
     bool save_per_step_ssm = false;
 

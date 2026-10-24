@@ -10818,6 +10818,7 @@ GGML_API struct ggml_tensor * ggml_ns_attention(
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
         struct ggml_tensor  * kv_pos,
+        struct ggml_tensor  * head_type,
         float                  scale) {
     GGML_ASSERT(q->ne[0] == k->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -10839,6 +10840,7 @@ GGML_API struct ggml_tensor * ggml_ns_attention(
     result->src[2] = v;
     result->src[3] = mask;
     result->src[4] = kv_pos;
+    result->src[5] = head_type;
 
     return result;
 }
@@ -22959,10 +22961,24 @@ static void ggml_compute_forward_ns_attention(
         const int64_t hk = h * n_head_kv / n_head;
 
         // Sanity log: print first 4 values of Q, K, V raw data for the first head
-        if (ith == 0 && h == h_start) {
+        static int ns_sanity_off = -1;
+        if (ns_sanity_off < 0) {
+            const char * e = getenv("NSATTEND_NO_DUMP");
+            ns_sanity_off = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (!ns_sanity_off && ith == 0 && h == h_start) {
             fprintf(stderr, "NSAttend sanity: Dk=%lld Dv=%lld n_head=%lld n_head_kv=%lld n_tokens=%lld n_kv=%lld\n",
                     (long long)Dk, (long long)Dv, (long long)n_head, (long long)n_head_kv,
                     (long long)n_tokens, (long long)n_kv);
+            fprintf(stderr, "NSA-IN-CPU q=[%f %f %f %f] k0=[%f %f %f %f] m=[%f %f %f %f] kvp=[%d %d %d %d]\n",
+                ((const float*)q_t->data)[0], ((const float*)q_t->data)[1], ((const float*)q_t->data)[2], ((const float*)q_t->data)[3],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[0])) : ((const float*)k_t->data)[0],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[1])) : ((const float*)k_t->data)[1],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[2])) : ((const float*)k_t->data)[2],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[3])) : ((const float*)k_t->data)[3],
+                mask ? ((const float*)mask->data)[0] : -9.f, mask ? ((const float*)mask->data)[1] : -9.f,
+                mask ? ((const float*)mask->data)[2] : -9.f, mask ? ((const float*)mask->data)[3] : -9.f,
+                kvp ? kvp[0] : -1, kvp ? kvp[1] : -1, kvp ? kvp[2] : -1, kvp ? kvp[3] : -1);
             fprintf(stderr, "NSAttend sanity: q_t->nb = [%lld, %lld, %lld, %lld]\n",
                     (long long)q_t->nb[0], (long long)q_t->nb[1], (long long)q_t->nb[2], (long long)q_t->nb[3]);
             fprintf(stderr, "NSAttend sanity: k_t->nb = [%lld, %lld, %lld, %lld]\n",

@@ -436,6 +436,7 @@ struct gpt_params {
     bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx or --fused-indexer-topk)
     bool swa_compress      = false;
     bool kv_box            = false; // enable KVBox KV cache mirroring (off by default; opt-in via --kv-box)
+    bool kvbox_cpu        = false; // force KVBox CPU path even when cache tensors are on device
     bool chat_wrap         = false; // wrap -p prompt in ChatML (<|im_start|>user...assistant) for instruct models
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;

@@ -70,6 +70,17 @@ struct KVBox {
     uint64_t prefill_retrievals;
     uint64_t abs_pos;
 
+    // ---- GPU-resident compressed store ----
+    // compressed_kv_store[layer][slot][entry_bytes]; entry =
+    // n_kv_heads*2*head_dim int8 codes + n_kv_heads*2 fp16 scales.
+    void * dev_store = nullptr;      // device buffer (layer-major)
+    float * dev_rope_freqs = nullptr;// device rope freq table
+    uint32_t dev_rope_n = 0;         // n_rot used to build freqs
+    uint32_t dev_max_slots = 0;      // ring capacity (positions)
+    size_t   entry_bytes = 0;        // per (layer,slot) compressed entry
+    bool     gpu_store = false;      // device store allocated
+    std::vector<int64_t> slot_pos;   // ring slot -> position tag (-1 = empty)
+
     std::vector<float> retrieval_q;
     int64_t retrieval_q_pos;
     uint32_t retrieval_q_ntok;
@@ -169,6 +180,14 @@ struct KVBox {
         pg.sum_count++;
         pg.n_tokens++;
     }
+
+    // Allocate the device store. Called lazily on first GPU write.
+    void ensure_gpu_store(uint32_t layers, uint32_t heads, uint32_t dim,
+                          uint32_t slots, const std::vector<float> & freqs);
+    // Free the device store.
+    void free_gpu_store();
+    // GPU write path entry — declared in kvbox.cuh, defined in kvbox.cu.
+    // Called from llama.cpp when the cache tensors live on a device buffer.
 
     // Write INT8-quantized K and V for (token_idx, layer, head).
     // k_f16 must be PRE-RoPE (unrotated); v_f16 is raw.
