@@ -1803,6 +1803,23 @@ extern "C" {
     void   kvbox_cuda_sync();
 }
 
+#if !defined(GGML_USE_CUDA)
+// CPU-only build: no kvbox.cu objects are compiled, so provide no-op stubs.
+// store_alloc returns nullptr -> gpu_store stays false and the callers
+// short-circuit, leaving the plain CPU KV path active.
+extern "C" {
+    void * kvbox_cuda_store_alloc(size_t) { return nullptr; }
+    void   kvbox_cuda_store_free(void *) {}
+    void * kvbox_cuda_malloc(size_t) { return nullptr; }
+    void   kvbox_cuda_free(void *) {}
+    void   kvbox_cuda_upload(void *, const void *, size_t) {}
+    void   kvbox_cuda_write_slot(const void *, const void *, int, long long, long long, size_t, const float *, int, long long, int, int, void *, int, int, int) {}
+    void   kvbox_cuda_read_slot(void *, void *, int, long long, long long, size_t, const float *, int, long long, int, int, const void *, int, int, int) {}
+    void   kvbox_cuda_download(void *, const void *, size_t) {}
+    void   kvbox_cuda_sync() {}
+}
+#endif // !GGML_USE_CUDA
+
 void KVBox::ensure_gpu_store(uint32_t layers, uint32_t heads, uint32_t dim,
                              uint32_t slots, const std::vector<float> & freqs) {
     if (gpu_store && n_layers == layers && n_kv_heads == heads && head_dim == dim
