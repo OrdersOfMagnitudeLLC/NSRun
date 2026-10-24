@@ -57,6 +57,7 @@
 #include "ggml-cuda/hadamard.cuh"
 #include "ggml-cuda/reduce.cuh"
 #include "ggml-cuda/ns-infer.cuh"
+#include "ggml-cuda/ns-attention.cuh"
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/delta-net.cuh"
 #include "ggml-cuda/kda.cuh"
@@ -4231,6 +4232,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_ns_infer(ctx, dst);
             break;
 #endif
+        case GGML_OP_NS_ATTENTION:
+            ggml_cuda_op_ns_attention(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -5088,6 +5092,22 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                    op->src[0]->nb[0] == sizeof(float);
 #endif
+        case GGML_OP_NS_ATTENTION: {
+            // q/k/v f32-or-f16, dst f32, optional mask f16/f32, optional i32 kv_pos
+            if (getenv("NS_ATTN_FORCE_CPU")) return false;
+            const ggml_tensor * q = op->src[0];
+            const ggml_tensor * k = op->src[1];
+            const ggml_tensor * v = op->src[2];
+            const ggml_tensor * m = op->src[3];
+            const ggml_tensor * p = op->src[4];
+            if (op->type != GGML_TYPE_F32) return false;
+            if (!((q->type == GGML_TYPE_F16 || q->type == GGML_TYPE_F32) &&
+                  (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32) &&
+                  (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_F32))) return false;
+            if (m && !(m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_F32)) return false;
+            if (p && p->type != GGML_TYPE_I32) return false;
+            return true;
+        }
         case GGML_OP_ARGSORT_THRESH:
             // The CUDA bitonic argsort launches one thread per (padded) column, so the
             // row width rounded up to a power of 2 must fit in a single CUDA block (<=1024

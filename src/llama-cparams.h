@@ -52,6 +52,7 @@ struct llama_cparams {
     bool swa_compress = false;
     // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
     bool kv_box       = false;  // enable KVBox KV cache mirroring (off by default; opt-in via --kv-box)
+    bool kvbox_cpu   = false;  // force KVBox CPU path even for device-resident cache tensors
     int  dsa_top_k = -1;              // DSA top-k override (<0 => use the model's configured indexer_top_k)
     bool split_mode_graph_scheduling;
     //bool split_mode_f16;

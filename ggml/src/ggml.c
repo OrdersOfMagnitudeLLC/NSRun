@@ -10817,6 +10817,8 @@ GGML_API struct ggml_tensor * ggml_ns_attention(
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * mask,
+        struct ggml_tensor  * kv_pos,
+        struct ggml_tensor  * head_type,
         float                  scale) {
     GGML_ASSERT(q->ne[0] == k->ne[0]);
     GGML_ASSERT(k->ne[1] == v->ne[1]);
@@ -10837,6 +10839,8 @@ GGML_API struct ggml_tensor * ggml_ns_attention(
     result->src[1] = k;
     result->src[2] = v;
     result->src[3] = mask;
+    result->src[4] = kv_pos;
+    result->src[5] = head_type;
 
     return result;
 }
@@ -22918,6 +22922,18 @@ static void ggml_compute_forward_ns_attention(
     const struct ggml_tensor * k_t = dst->src[1];
     const struct ggml_tensor * v_t = dst->src[2];
     const struct ggml_tensor * mask = dst->src[3];
+    // I32 [n_kv] seq pos per KV slot; NULL falls back to slot==pos.
+    // Required after KVBox injection — slots no longer map 1:1 to positions.
+    const int32_t * kvp = dst->src[4] ? (const int32_t *) dst->src[4]->data : NULL;
+
+    // newest cell pos = current decode position; current tokens may not
+    // occupy the last n_tokens slots after KVBox injection remaps cells.
+    int32_t ns_max_pos = -1;
+    if (kvp) {
+        for (int64_t j2 = 0; j2 < k_t->ne[1]; j2++) {
+            if ((int)kvp[j2] > ns_max_pos) ns_max_pos = (int)kvp[j2];
+        }
+    }
 
     float scale;
     memcpy(&scale, dst->op_params, sizeof(float));
@@ -22945,10 +22961,24 @@ static void ggml_compute_forward_ns_attention(
         const int64_t hk = h * n_head_kv / n_head;
 
         // Sanity log: print first 4 values of Q, K, V raw data for the first head
-        if (ith == 0 && h == h_start) {
+        static int ns_sanity_off = -1;
+        if (ns_sanity_off < 0) {
+            const char * e = getenv("NSATTEND_NO_DUMP");
+            ns_sanity_off = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (!ns_sanity_off && ith == 0 && h == h_start) {
             fprintf(stderr, "NSAttend sanity: Dk=%lld Dv=%lld n_head=%lld n_head_kv=%lld n_tokens=%lld n_kv=%lld\n",
                     (long long)Dk, (long long)Dv, (long long)n_head, (long long)n_head_kv,
                     (long long)n_tokens, (long long)n_kv);
+            fprintf(stderr, "NSA-IN-CPU q=[%f %f %f %f] k0=[%f %f %f %f] m=[%f %f %f %f] kvp=[%d %d %d %d]\n",
+                ((const float*)q_t->data)[0], ((const float*)q_t->data)[1], ((const float*)q_t->data)[2], ((const float*)q_t->data)[3],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[0])) : ((const float*)k_t->data)[0],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[1])) : ((const float*)k_t->data)[1],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[2])) : ((const float*)k_t->data)[2],
+                q_t->type == GGML_TYPE_F16 ? ((float)GGML_FP16_TO_FP32(((const ggml_fp16_t*)k_t->data)[3])) : ((const float*)k_t->data)[3],
+                mask ? ((const float*)mask->data)[0] : -9.f, mask ? ((const float*)mask->data)[1] : -9.f,
+                mask ? ((const float*)mask->data)[2] : -9.f, mask ? ((const float*)mask->data)[3] : -9.f,
+                kvp ? kvp[0] : -1, kvp ? kvp[1] : -1, kvp ? kvp[2] : -1, kvp ? kvp[3] : -1);
             fprintf(stderr, "NSAttend sanity: q_t->nb = [%lld, %lld, %lld, %lld]\n",
                     (long long)q_t->nb[0], (long long)q_t->nb[1], (long long)q_t->nb[2], (long long)q_t->nb[3]);
             fprintf(stderr, "NSAttend sanity: k_t->nb = [%lld, %lld, %lld, %lld]\n",
@@ -22983,6 +23013,7 @@ static void ggml_compute_forward_ns_attention(
                 fprintf(stderr, " %f", vv);
             }
             fprintf(stderr, "\n");
+
         }
 
         // Head type detection: sample 8 query rows
@@ -23014,11 +23045,13 @@ static void ggml_compute_forward_ns_attention(
                     sum += scores[j];
                 }
 
-                int q_pos = (int)(n_kv - n_tokens + i);
+                int q_pos = kvp ? (int)ns_max_pos - (int)(n_tokens - 1 - i) : (int)(n_kv - n_tokens + i);
                 float mean_w = sum / n_kv;
                 float num = 0.0f, den_d = 0.0f, den_w = 0.0f;
                 for (int64_t j = 0; j < n_kv; j++) {
-                    float dist = (float)abs(q_pos - (int)j);
+                    int sp = kvp ? (int)kvp[j] : (int)j;
+                    if (sp < 0) continue;
+                    float dist = (float)abs(q_pos - sp);
                     float w = scores[j] / sum;
                     float d_diff = dist - (n_kv / 2.0f);
                     float w_diff = w - mean_w;
@@ -23042,10 +23075,16 @@ static void ggml_compute_forward_ns_attention(
             const char * q_ptr = (const char *)q_t->data + h * q_t->nb[2] + i * q_t->nb[1];
 
             int64_t j_start = 0, j_end = n_kv;
+            int q_seq_pos = kvp ? (int)ns_max_pos - (int)(n_tokens - 1 - i) : (int)(n_kv - n_tokens + i);
             if (head_local) {
-                int q_pos = (int)(n_kv - n_tokens + i);
-                j_start = (q_pos - local_window) > 0 ? (q_pos - local_window) : 0;
-                j_end = ((int64_t)(q_pos + local_window + 1) < n_kv) ? (int64_t)(q_pos + local_window + 1) : n_kv;
+                if (kvp) {
+                    // slot indices do not track seq pos after KVBox
+                    // injection/eviction — filter by seq pos inside the loop
+                    j_start = 0; j_end = n_kv;
+                } else {
+                    j_start = (q_seq_pos - local_window) > 0 ? (q_seq_pos - local_window) : 0;
+                    j_end = ((int64_t)(q_seq_pos + local_window + 1) < n_kv) ? (int64_t)(q_seq_pos + local_window + 1) : n_kv;
+                }
             }
 
             float max_score = -1e30f;
@@ -23053,6 +23092,13 @@ static void ggml_compute_forward_ns_attention(
                 if (j < j_start || j >= j_end) {
                     scores[j] = -1e30f;
                     continue;
+                }
+                if (kvp && head_local) {
+                    int sp = (int)kvp[j];
+                    if (sp < 0 || sp < q_seq_pos - local_window || sp > q_seq_pos + local_window) {
+                        scores[j] = -1e30f;
+                        continue;
+                    }
                 }
                 const char * k_ptr = (const char *)k_t->data + hk * k_t->nb[2] + j * k_t->nb[1];
                 float dot = 0.0f;
