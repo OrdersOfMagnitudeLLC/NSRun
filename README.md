@@ -2,13 +2,19 @@
 
 [![License: Dual MIT/OOM](https://img.shields.io/badge/license-MIT%20%2B%20OOM%20Commercial-orange.svg)](LICENSE)
 
-## Running NSRun (CPU)
+## Running NSRun
 
-GPU users must pass `-ngl 0` to force CPU-only inference.
-NSKVCache and other NS ops do not have CUDA kernels yet.
-Without this flag the model will hang on GPU hardware.
+NSRun runs on CPU and CUDA (sm_86 or newer). KVBox, NSAttend, and the rest
+of the NS stack work on GPU — no `-ngl 0` workaround needed anymore.
 
-Verified command:
+Verified command (GPU):
+```bash
+./llama-cli -m your-model-q4_k_m.gguf \
+  -c 1048576 -b 1024 --kv-box -ngl 999 \
+  -p "your prompt"
+```
+
+CPU-only:
 ```bash
 ./llama-cli -m your-model-q4_k_m.gguf \
   -c 1048576 -b 1024 --kv-box -ngl 0 \
@@ -16,7 +22,31 @@ Verified command:
 ```
 
 Minimum -b 1024 required for coherent generation.
-CUDA and ROCm support in progress.
+
+### NS flags
+
+| Flag | Effect |
+|---|---|
+| `--kv-box` | enable KVBox GPU-native KV compression |
+| `-nsa`, `--ns-attend` | enable NSAttend sparse decode attention |
+| `--force-ns-attend` | apply NSAttend to recurrent/Mamba layers on hybrid archs (default: full-attention layers only) |
+| `-nsi`, `--ns-infer` | enable NSInfer MLP sparsity (requires `-DNS_INFER_ENABLED` build) |
+| `--ns-infer-threshold F` | NSInfer energy retention threshold |
+| `--no-ns-attend` / `--no-ns-infer` | disable NSAttend / NSInfer (overrides env vars) |
+
+### GPU benchmarks
+
+NVIDIA A5000 (sm_86), Nemotron-Nano-8B-v1:
+
+| Config | Context | Decode t/s | Prefill t/s | VRAM |
+|---|---|---|---|---|
+| Baseline Q8_0 | 32K | 111 | 265 | ~8 GB |
+| `--kv-box` | 1M | 111 | 1823 | 5.4 GB |
+| `--kv-box --ns-attend` | 1M | 102 | 545 | 5.4 GB |
+| NSQuant v2 (4.8 GB) | 32K | 108 | — | ~5 GB |
+
+KVBox compresses the KV cache by ~66× at 1M context on GPU
+(140 GB naive fp16 → ~2.1 GB). On CPU fp32, compression is ~135×.
 
 ## OOM Additions
 
@@ -38,6 +68,9 @@ Everything else is upstream ik_llama / llama.cpp.
 
 Base engine (llama.cpp/ik_llama): MIT: see [LICENSE-MIT](LICENSE-MIT) 
 NS Additions (NSKVCache, NSAttend, NSInfer, NSQuant): OOM Commercial License: see [LICENSE-OOM](LICENSE-OOM)
+
+NSKVCache, NSAttend, and NSQuant are compiled binaries from NS Suite (OOM
+commercial license). Source not included. See [LICENSE-OOM](LICENSE-OOM).
 
 ## TL;DR
 
