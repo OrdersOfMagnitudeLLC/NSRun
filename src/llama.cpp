@@ -1794,6 +1794,12 @@ extern "C" {
             const float * rope_freqs_dev, int n_rot, long long pos,
             int n_kv_heads, int head_dim,
             void * store_dev, int layer, int slot, int max_slots);
+    void   kvbox_cuda_write_batch(const void * k_base_dev, const void * v_base_dev,
+            int v_trans, long long v_rows, long long cell_base,
+            size_t k_step, size_t v_step,
+            const float * rope_freqs_dev, int n_rot, long long pos_base,
+            int n_kv_heads, int head_dim, int n_tokens,
+            void * store_dev, int layer, int max_slots);
     void   kvbox_cuda_read_slot(void * k_row_dev, void * v_row_dev,
             int v_trans, long long v_rows, long long v_cell, size_t v_step,
             const float * rope_freqs_dev, int n_rot, long long pos,
@@ -1847,6 +1853,102 @@ void KVBox::free_gpu_store() {
 }
 
 // GPU write path: quantize one position's K+V for a layer on device into
+// Deferred retrieval-layer bookkeeping: write kernels push compressed entries
+// to the device store; pending_retrieval queues the (pos, slot) pairs whose
+// kv_buffer slice + QUEST page-index update still need host work. Drained in
+// batches so cuda sync + D2H stay off the per-token decode critical path.
+static void kvbox_drain_retrieval(llama_context & lctx,
+        const std::vector<float> & freqs, uint32_t n_rot, size_t max_drain) {
+    KVBox & kb = lctx.kv_box;
+    if (!kb.gpu_store || kb.pending_retrieval.empty()) return;
+    const int il = (int)kb.retrieval_layer;
+    const uint32_t heads = lctx.model.hparams.n_head_kv(il);
+    const uint32_t dim   = lctx.model.hparams.n_embd_head_k(il);
+    kvbox_cuda_sync();
+    const size_t ent = kb.entry_bytes;
+    std::vector<char> buf(ent);
+    std::vector<ggml_fp16_t> k_pre(dim), k_post(dim);
+    size_t n = 0;
+    while (!kb.pending_retrieval.empty() && n++ < max_drain) {
+        const auto pend = kb.pending_retrieval.front();
+        kb.pending_retrieval.pop();
+        const int64_t pos = pend.first;
+        const int slot = pend.second;
+        // ring slot may already have been overwritten by a newer position
+        if (slot < 0 || slot >= (int)kb.slot_pos.size() || kb.slot_pos[slot] != pos) continue;
+        kvbox_cuda_download(buf.data(),
+            (const char *)kb.dev_store + ((size_t)il * kb.dev_max_slots + slot) * ent, ent);
+        if (kb.kv_buffer.find(pos) == kb.kv_buffer.end()
+                && kb.kv_buffer.size() >= kb.max_positions && !kb.write_order.empty()) {
+            int64_t evict_pos = kb.write_order.front(); kb.write_order.pop();
+            kb.kv_buffer.erase(evict_pos); kb.kv_scales.erase(evict_pos);
+            kb.total_bytes -= kb.per_pos_bytes;
+        }
+        auto & kv = kb.kv_buffer[pos];
+        auto & sc = kb.kv_scales[pos];
+        if (kv.empty()) {
+            kv.assign((size_t)kb.n_layers * heads * 2 * dim, 0);
+            sc.assign((size_t)kb.n_layers * heads * 2, (ggml_fp16_t)0);
+            kb.write_order.push(pos);
+            kb.total_bytes += kb.per_pos_bytes;
+        }
+        const int8_t * kc = (const int8_t *)buf.data();
+        const int8_t * vc = kc + (size_t)heads * dim;
+        const ggml_fp16_t * gsc = (const ggml_fp16_t *)(buf.data() + (size_t)heads * dim * 2);
+        for (uint32_t h = 0; h < heads; ++h) {
+            memcpy(kv.data() + (size_t)(il * heads + h) * dim, kc + (size_t)h * dim, dim);
+            memcpy(kv.data() + (size_t)(kb.n_layers * heads + il * heads + h) * dim,
+                   vc + (size_t)h * dim, dim);
+            sc[(il * heads + h) * 2 + 0] = gsc[h * 2 + 0];
+            sc[(il * heads + h) * 2 + 1] = gsc[h * 2 + 1];
+            // Page index: stored codes are pre-RoPE K; dequantize, then rotate
+            // forward by pos to recover the post-RoPE K the QUEST bound needs.
+            const float ksc = ggml_fp16_to_fp32(gsc[h * 2 + 0]);
+            for (uint32_t d = 0; d < dim; ++d)
+                k_pre[d] = ggml_fp32_to_fp16((float)kc[(size_t)h * dim + d] * ksc);
+            memcpy(k_post.data(), k_pre.data(), dim * sizeof(ggml_fp16_t));
+            kvbox_rope_k(k_post.data(), dim, pos, freqs, n_rot);
+            kb.update_page_index(pos, (uint32_t)il, h, k_post.data(), k_pre.data());
+        }
+    }
+}
+
+// Batched mirror of a whole ubatch span: n_tokens consecutive positions
+// (abs_pos..abs_pos+n-1) at consecutive working-cache cells (cell_base+t).
+// One kernel launch per layer replaces the old per-token-per-layer storm.
+static void kvbox_gpu_write_span(llama_context & lctx, int64_t pos_base, uint32_t n_tokens, int il,
+        const ggml_tensor * k_t, const ggml_tensor * v_t, uint32_t cell_base,
+        size_t k_step, size_t v_step, bool v_trans, uint32_t v_rows,
+        const std::vector<float> & freqs, uint32_t n_rot) {
+    KVBox & kb = lctx.kv_box;
+    const uint32_t heads = lctx.model.hparams.n_head_kv(il);
+    const uint32_t dim   = lctx.model.hparams.n_embd_head_k(il);
+    kb.ensure_gpu_store(kb.n_layers, heads, dim, (uint32_t)kb.max_positions, freqs);
+    if (!kb.gpu_store || !k_t || !k_t->data || n_tokens == 0) return;
+    const char * v_base = nullptr;
+    if (v_t && v_t->data) v_base = (const char *)v_t->data;
+    kvbox_cuda_write_batch(k_t->data, v_base,
+        v_trans ? 1 : 0, (long long)v_rows, (long long)cell_base,
+        k_step, v_step,
+        kb.dev_rope_freqs, (int)n_rot, (long long)pos_base,
+        (int)heads, (int)dim, (int)n_tokens,
+        kb.dev_store, il, (int)kb.dev_max_slots);
+    // host-side bookkeeping for all n positions: slot tags + retrieval queue
+    const bool retr = (il == (int)kb.retrieval_layer);
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        const int64_t pos = pos_base + t;
+        const int slot = (int)(pos % kb.dev_max_slots);
+        if (slot >= 0 && slot < (int)kb.slot_pos.size()) kb.slot_pos[slot] = pos;
+        if (retr) {
+            kb.pending_retrieval.push({pos, slot});
+            if (kb.pending_retrieval.size() >= 512) {
+                kvbox_drain_retrieval(lctx, freqs, n_rot, 256);
+            }
+        }
+        kb.writes++;
+    }
+}
+
 // compressed_kv_store, then fetch the small compressed entry (D2H ~2KB) into
 // kv_buffer so the CPU inject path keeps working until reads move to device.
 static void kvbox_gpu_write_pos(llama_context & lctx, int64_t pos, int il,
@@ -1875,50 +1977,14 @@ static void kvbox_gpu_write_pos(llama_context & lctx, int64_t pos, int il,
             v_trans ? 1 : 0, v_rows, v_step);
     }
     if (slot >= 0 && slot < (int)kb.slot_pos.size()) kb.slot_pos[slot] = pos;
-    // Populate kv_buffer only for the retrieval layer — it feeds the host-side
-    // query_content_k retrieval scoring. The inject path now reads the device
-    // store directly, so the other layers' kv_buffer slices are unused.
+    // Retrieval-layer host bookkeeping (kv_buffer slice + QUEST page index) is
+    // deferred to batched drains — keeps cuda sync + D2H copies out of the
+    // per-token decode critical path. Reconstructed from the compressed entry,
+    // so no live-tensor reads are needed.
     if (il == (int)kb.retrieval_layer) {
-    kvbox_cuda_sync();
-    const size_t ent = kb.entry_bytes;
-    std::vector<char> buf(ent);
-    kvbox_cuda_download(buf.data(),
-        (const char *)kb.dev_store + ((size_t)il * kb.dev_max_slots + slot) * ent, ent);
-    if (kb.kv_buffer.find(pos) == kb.kv_buffer.end()
-            && kb.kv_buffer.size() >= kb.max_positions && !kb.write_order.empty()) {
-        int64_t evict_pos = kb.write_order.front(); kb.write_order.pop();
-        kb.kv_buffer.erase(evict_pos); kb.kv_scales.erase(evict_pos);
-        kb.total_bytes -= kb.per_pos_bytes;
-    }
-    auto & kv = kb.kv_buffer[pos];
-    auto & sc = kb.kv_scales[pos];
-    if (kv.empty()) {
-        kv.assign((size_t)kb.n_layers * heads * 2 * dim, 0);
-        sc.assign((size_t)kb.n_layers * heads * 2, (ggml_fp16_t)0);
-        kb.write_order.push(pos);
-        kb.total_bytes += kb.per_pos_bytes;
-    }
-    const int8_t * kc = (const int8_t *)buf.data();
-    const int8_t * vc = kc + (size_t)heads * dim;
-    const ggml_fp16_t * gsc = (const ggml_fp16_t *)(buf.data() + (size_t)heads * dim * 2);
-    for (uint32_t h = 0; h < heads; ++h) {
-        memcpy(kv.data() + (size_t)(il * heads + h) * dim, kc + (size_t)h * dim, dim);
-        memcpy(kv.data() + (size_t)(kb.n_layers * heads + il * heads + h) * dim,
-               vc + (size_t)h * dim, dim);
-        sc[(il * heads + h) * 2 + 0] = gsc[h * 2 + 0];
-        sc[(il * heads + h) * 2 + 1] = gsc[h * 2 + 1];
-    }
-    }
-    // QUEST page index for the retrieval layer: fetch the raw (post-RoPE) K
-    // row for this slot (small D2H), un-rotate on host, update the page index.
-    if (il == (int)kb.retrieval_layer) {
-        std::vector<ggml_fp16_t> krow((size_t)heads * dim);
-        kvbox_cuda_download(krow.data(), k_row, krow.size() * sizeof(ggml_fp16_t));
-        std::vector<ggml_fp16_t> k_pre(dim);
-        for (uint32_t h = 0; h < heads; ++h) {
-            memcpy(k_pre.data(), krow.data() + (size_t)h * dim, dim * sizeof(ggml_fp16_t));
-            kvbox_rope_k(k_pre.data(), dim, -(int64_t)pos, freqs, n_rot);
-            kb.update_page_index(pos, il, h, krow.data() + (size_t)h * dim, k_pre.data());
+        kb.pending_retrieval.push({pos, slot});
+        if (kb.pending_retrieval.size() >= 512) {
+            kvbox_drain_retrieval(lctx, freqs, n_rot, 256);
         }
     }
     kb.writes++;
@@ -6603,7 +6669,7 @@ static int llama_decode_internal(
     uint32_t n_outputs_prev_embd = 0;
 
     // NSKVCache — OOM LLC Commercial License — see LICENSE-OOM
-    const auto n_ubatch = cparams.kv_box ? (uint32_t)256 : cparams.n_ubatch;
+    const auto n_ubatch = cparams.kv_box ? (uint32_t)128 : cparams.n_ubatch;
 
     // TODO: simplify or deprecate
     std::vector<llama_pos> pos;
@@ -7020,14 +7086,11 @@ static int llama_decode_internal(
 
                 const uint32_t v_rows = has_v && kv_self.v_trans ? kv_self.rows(il) : 0;
                 if (!ggml_backend_buffer_is_host(kv_self.k_l[il]->buffer) && !lctx.cparams.kvbox_cpu) {
-                    // GPU write path — no full-tensor D2H.
-                    for (uint32_t t = 0; t < n_tokens; ++t) {
-                        int64_t k_pos = (int64_t)(lctx.kv_box.abs_pos + t);
-                        kvbox_gpu_write_pos(lctx, k_pos, il, kv_self.k_l[il],
-                            has_v ? kv_self.v_l[il] : nullptr,
-                            (uint32_t)(cache_head + t), k_step, v_step,
-                            kv_self.v_trans, v_rows, rope_freqs_mirror, n_rot_mirror);
-                    }
+                    // GPU write path — batched: one launch for the whole ubatch.
+                    kvbox_gpu_write_span(lctx, (int64_t)lctx.kv_box.abs_pos, n_tokens, il,
+                        kv_self.k_l[il], has_v ? kv_self.v_l[il] : nullptr,
+                        (uint32_t)cache_head, k_step, v_step,
+                        kv_self.v_trans, v_rows, rope_freqs_mirror, n_rot_mirror);
                 } else {
                 std::vector<ggml_fp16_t> v_row_m(has_v && kv_self.v_trans ? head_dim : 0);
                 std::vector<ggml_fp16_t> k_pre_mirror(head_dim);
@@ -12235,6 +12298,9 @@ void llama_kvbox_inject(struct llama_context * ctx) {
     if (lctx.kv_box.retrieval_q.empty()) return;
 
     lctx.kv_box.decode_injected_once = true;
+
+    // Flush deferred retrieval-layer bookkeeping before scoring pages.
+    kvbox_drain_retrieval(lctx, kvbox_rope_freqs(hparams, cparams), hparams.n_rot, SIZE_MAX);
 
     // Cap injection to leave room for question tokens in the working cache.
     // Keep at least the last 128 tokens (question + context) untouched.

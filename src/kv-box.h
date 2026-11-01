@@ -62,6 +62,10 @@ struct KVBox {
     std::unordered_map<int64_t, std::vector<ggml_fp16_t>> kv_scales;
     std::queue<int64_t> write_order;  // FIFO order for eviction
 
+    // Retrieval-layer bookkeeping deferred off the decode critical path:
+    // (pos, ring slot) pairs awaiting kv_buffer + page-index updates.
+    std::queue<std::pair<int64_t, int>> pending_retrieval;
+
     // Page scoring index: page_id → max/min/sum K (retrieval_layer only, post-RoPE)
     std::unordered_map<int64_t, KVBoxPage> pages;
 
@@ -92,7 +96,7 @@ struct KVBox {
     KVBox()
         : n_layers(0), group_size(4), n_kv_heads(0), head_dim(0)
         , n_tokens(0), n_slots(0), per_pos_bytes(0), total_bytes(0), is_init(false)
-        , max_positions(4096)
+        , max_positions(32768)
         , writes(0), retrievals(0), prefill_retrievals(0), abs_pos(0)
         , retrieval_q_pos(0), retrieval_q_ntok(0), decode_injected_once(false), retrieval_layer(0)
         , last_prefill_token(-1), last_prefill_pos(-1)
@@ -125,8 +129,8 @@ struct KVBox {
         pages.clear();
         while (!write_order.empty()) write_order.pop();
         // Bound buffer to avoid OOM: keep at most max_positions entries.
-        // INT8: ~18.7KB/pos for 36-layer 2-kv-head 128-dim → 4096 pos ≈ 75MB.
-        max_positions = 4096;
+        // INT8: ~81.9KB/pos for 40-layer 8-kv-head 128-dim → 32768 pos ≈ 2.6GB.
+        max_positions = 32768;
     }
 
     bool initialized() const { return is_init; }
@@ -301,6 +305,7 @@ struct KVBox {
         kv_scales.clear();
         pages.clear();
         while (!write_order.empty()) write_order.pop();
+        while (!pending_retrieval.empty()) pending_retrieval.pop();
         total_bytes = 0;
     }
 

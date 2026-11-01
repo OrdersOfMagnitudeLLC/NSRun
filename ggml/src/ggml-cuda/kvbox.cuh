@@ -27,6 +27,15 @@ extern "C" {
             int n_kv_heads, int head_dim,
             void * store_dev, int layer, int slot, int max_slots);
 
+    // Batched variant: one launch for n_tokens consecutive cells/positions.
+    // k_base/v_base are tensor data bases; kernel offsets by (cell_base+t)*step.
+    void   kvbox_cuda_write_batch(const void * k_base_dev, const void * v_base_dev,
+            int v_trans, long long v_rows, long long cell_base,
+            size_t k_step, size_t v_step,
+            const float * rope_freqs_dev, int n_rot, long long pos_base,
+            int n_kv_heads, int head_dim, int n_tokens,
+            void * store_dev, int layer, int max_slots);
+
     // Launch the read/inject kernel: decompress codes back to fp16, re-rotate
     // K, and write the reconstructed K/V rows into the working-cache tensors
     // on device. Symmetric to the write kernel.

@@ -28,10 +28,11 @@ extern "C" void kvbox_cuda_download(void * dst_host, const void * src_dev, size_
 extern "C" void kvbox_cuda_sync() { cudaDeviceSynchronize(); }
 
 // block = head_dim threads (128); grid.x = n_kv_heads; each block = one head.
-__global__ void k_kvbox_write_slot(
+// grid.y (batch kernel) = token index within the ubatch.
+__device__ __forceinline__ void kvbox_write_one(
         const __half * __restrict__ k_row,
         const __half * __restrict__ v_row,
-        int v_trans, long long v_rows, long long v_cell, size_t v_step,
+        int v_trans, long long v_rows, long long v_cell,
         const float * __restrict__ rope_freqs, int n_rot, long long pos,
         int n_kv_heads, int head_dim,
         int8_t * __restrict__ k_codes,
@@ -102,6 +103,19 @@ __global__ void k_kvbox_write_slot(
     v_codes[(size_t)h * head_dim + d] = (int8_t)qv;
 }
 
+__global__ void k_kvbox_write_slot(
+        const __half * __restrict__ k_row,
+        const __half * __restrict__ v_row,
+        int v_trans, long long v_rows, long long v_cell,
+        const float * __restrict__ rope_freqs, int n_rot, long long pos,
+        int n_kv_heads, int head_dim,
+        int8_t * __restrict__ k_codes,
+        int8_t * __restrict__ v_codes,
+        __half * __restrict__ scales) {
+    kvbox_write_one(k_row, v_row, v_trans, v_rows, v_cell,
+        rope_freqs, n_rot, pos, n_kv_heads, head_dim, k_codes, v_codes, scales);
+}
+
 extern "C" void kvbox_cuda_write_slot(
         const void * k_row_dev, const void * v_row_dev,
         int v_trans, long long v_rows, long long v_cell, size_t v_step,
@@ -116,9 +130,49 @@ extern "C" void kvbox_cuda_write_slot(
     __half  * sc   = (__half *)(ent + (size_t)n_kv_heads * head_dim * 2);
     k_kvbox_write_slot<<<n_kv_heads, head_dim>>>(
         (const __half *)k_row_dev, (const __half *)v_row_dev,
-        v_trans, v_rows, v_cell, v_step,
+        v_trans, v_rows, v_cell,
         rope_freqs_dev, n_rot, pos,
         n_kv_heads, head_dim, kc, vc, sc);
+}
+
+// Batched write: one launch covers n_tokens consecutive cells/positions for a
+// layer. grid = (n_kv_heads, n_tokens); block = head_dim. Positions are
+// pos_base + t, cells cell_base + t (contiguous in the working cache).
+__global__ void k_kvbox_write_batch(
+        const char * __restrict__ k_base, const char * __restrict__ v_base,
+        int v_trans, long long v_rows, long long cell_base,
+        size_t k_step, size_t v_step,
+        const float * __restrict__ rope_freqs, int n_rot, long long pos_base,
+        int n_kv_heads, int head_dim,
+        uint8_t * __restrict__ store_dev, int layer, int max_slots) {
+    const int t = blockIdx.y;
+    const long long pos  = pos_base + t;
+    const long long cell = cell_base + t;
+    const long long slot = pos % (long long)max_slots;
+    const size_t entry = (size_t)n_kv_heads * head_dim * 2 + (size_t)n_kv_heads * 2 * sizeof(__half);
+    uint8_t * ent = store_dev + ((size_t)layer * max_slots + slot) * entry;
+    int8_t  * kc  = (int8_t *)ent;
+    int8_t  * vc  = (int8_t *)ent + (size_t)n_kv_heads * head_dim;
+    __half  * sc  = (__half *)(ent + (size_t)n_kv_heads * head_dim * 2);
+    const __half * k_row = (const __half *)(k_base + (size_t)cell * k_step);
+    const __half * v_row = v_base ? (const __half *)(v_base + (size_t)cell * v_step) : nullptr;
+    kvbox_write_one(k_row, v_row, v_trans, v_rows, cell,
+        rope_freqs, n_rot, pos, n_kv_heads, head_dim, kc, vc, sc);
+}
+
+extern "C" void kvbox_cuda_write_batch(
+        const void * k_base_dev, const void * v_base_dev,
+        int v_trans, long long v_rows, long long cell_base,
+        size_t k_step, size_t v_step,
+        const float * rope_freqs_dev, int n_rot, long long pos_base,
+        int n_kv_heads, int head_dim, int n_tokens,
+        void * store_dev, int layer, int max_slots) {
+    dim3 grid((unsigned)n_kv_heads, (unsigned)n_tokens);
+    k_kvbox_write_batch<<<grid, head_dim>>>(
+        (const char *)k_base_dev, (const char *)v_base_dev,
+        v_trans, v_rows, cell_base, k_step, v_step,
+        rope_freqs_dev, n_rot, pos_base,
+        n_kv_heads, head_dim, (uint8_t *)store_dev, layer, max_slots);
 }
 
 // ---- read/inject kernel: decompress one (pos,layer) slot's K+V and write the
