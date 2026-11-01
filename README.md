@@ -45,19 +45,28 @@ NVIDIA A5000 (sm_86), Nemotron-Nano-8B-v1:
 | `--kv-box --ns-attend` | 1M | 102 | 545 | 5.4 GB |
 | NSQuant v2 (4.8 GB) | 32K | 108 | — | ~5 GB |
 
-KVBox compresses the KV cache by ~66× at 1M context on GPU
-(140 GB naive fp16 → ~2.1 GB). On CPU fp32, compression is ~135×.
+### NSKVCache compression (1M context)
+
+| Platform | Model | KV store | Compression |
+|---|---|---|---|
+| CPU | Qwen2.5-3B (Q4_K_M) | 168.5 MiB | 208.7× |
+| GPU (RTX A5000) | Nemotron-Nano-8B-v1 | ~2.1 GB | ~66× |
+
+Both ratios are vs the model's raw fp16 KV cache (CPU: 35.2 GB →
+168.5 MiB; GPU: ~140 GB → ~2.1 GB, 5.4 GB total VRAM). The
+difference is not a regression — different model KV-per-token and
+different store layouts, so the factors aren't directly comparable.
 
 ## OOM Additions
 
 NSRun is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) (itself a fork of [llama.cpp](https://github.com/ggerganov/llama.cpp)) with four novel NS components:
 
-| Component | Location | What it does |
-|---|---|---|
-| NSKVCache | `include/kv-box.h` · `src/ns_kv_store.*` | 208.7× KV compression at 1M context |
-| NSAttend  | `ggml/src/ggml.c` (NS_ATTEND sections) | 28.7× sparse attention |
-| NSInfer   | `ggml/src/ggml.c` (NS_INFER sections) | Sparse MLP activation, +70% prompt eval at 72B |
-| NSQuant   | `NSQuant/` | Activation-aware quantization, 7.2× on 72B |
+| Component | Location | What it does | GPU |
+|---|---|---|---|
+| NSKVCache | `src/kv-box.h` · `src/ns_kv_store.*` · `ggml/src/ggml-cuda/kvbox.cu` | 208.7× KV compression at 1M context | CUDA (sm_86+) |
+| NSAttend  | `ggml/src/ggml.c` (NS_ATTEND sections) · `ggml/src/ggml-cuda/ns-attention.cu` | 28.7× sparse attention | CUDA |
+| NSInfer   | `ggml/src/ggml.c` (NS_INFER sections) · `ggml/src/ggml-cuda/ns-infer.cu` | Sparse MLP activation, +70% prompt eval at 72B | CUDA (WIP) |
+| NSQuant   | `NSQuant/` | Activation-aware quantization, 7.2× on 72B | CUDA (Q4_K/IQ quants) |
 
 OOM additions are marked with NS_ prefixes throughout.
 Everything else is upstream ik_llama / llama.cpp.
