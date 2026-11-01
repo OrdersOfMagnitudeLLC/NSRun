@@ -1820,6 +1820,7 @@ extern "C" {
     void   kvbox_cuda_free(void *) {}
     void   kvbox_cuda_upload(void *, const void *, size_t) {}
     void   kvbox_cuda_write_slot(const void *, const void *, int, long long, long long, size_t, const float *, int, long long, int, int, void *, int, int, int) {}
+    void   kvbox_cuda_write_batch(const void *, const void *, int, long long, long long, size_t, size_t, const float *, int, long long, int, int, int, void *, int, int) {}
     void   kvbox_cuda_read_slot(void *, void *, int, long long, long long, size_t, const float *, int, long long, int, int, const void *, int, int, int) {}
     void   kvbox_cuda_download(void *, const void *, size_t) {}
     void   kvbox_cuda_sync() {}

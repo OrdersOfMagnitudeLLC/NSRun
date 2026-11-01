@@ -106,12 +106,13 @@ __device__ __forceinline__ void kvbox_write_one(
 __global__ void k_kvbox_write_slot(
         const __half * __restrict__ k_row,
         const __half * __restrict__ v_row,
-        int v_trans, long long v_rows, long long v_cell,
+        int v_trans, long long v_rows, long long v_cell, size_t v_step,
         const float * __restrict__ rope_freqs, int n_rot, long long pos,
         int n_kv_heads, int head_dim,
         int8_t * __restrict__ k_codes,
         int8_t * __restrict__ v_codes,
         __half * __restrict__ scales) {
+    (void)v_step;
     kvbox_write_one(k_row, v_row, v_trans, v_rows, v_cell,
         rope_freqs, n_rot, pos, n_kv_heads, head_dim, k_codes, v_codes, scales);
 }
@@ -130,7 +131,7 @@ extern "C" void kvbox_cuda_write_slot(
     __half  * sc   = (__half *)(ent + (size_t)n_kv_heads * head_dim * 2);
     k_kvbox_write_slot<<<n_kv_heads, head_dim>>>(
         (const __half *)k_row_dev, (const __half *)v_row_dev,
-        v_trans, v_rows, v_cell,
+        v_trans, v_rows, v_cell, v_step,
         rope_freqs_dev, n_rot, pos,
         n_kv_heads, head_dim, kc, vc, sc);
 }
